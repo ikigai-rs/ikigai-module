@@ -1,0 +1,19 @@
+[package]
+name = "ikigai-module"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+description = "The ikigai dynamically-loadable module format (Phase 1: in-process proof). A host-side ModuleSpace routes IRIs to a module over a ModuleTransport; the module's endpoints resolve their sub-resources back against the host kernel."
+repository = "https://github.com/ikigai-rs/ikigai-module"
+homepage = "https://github.com/ikigai-rs/ikigai-module"
+keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
+
+[dependencies]
+ikigai-core = "0.1.21"  # needs the public Invocation::with_issuer (the module seam)
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+ikigai-xslt = "0.1.0"
+futures = "0.3"
