@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-module"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -18,3 +18,9 @@ serde = { version = "1", features = ["derive"] }
 # postcard framing ikigai-wire uses; `alloc` keeps it wasm-clean).
 futures = "0.3"
 postcard = { version = "1", features = ["alloc"] }
+
+# The UDS module server's peercred check (refuse connections from other users) needs the
+# kernel-verified peer UID — SO_PEERCRED / getpeereid — which is FFI. Unix only, so wasm
+# and Windows never pull it; the crate stays wasm-clean.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

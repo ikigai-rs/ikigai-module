@@ -24,14 +24,16 @@
 //!   proves the protocol (the session state machine + `Request`/`Capability`/
 //!   `Representation` marshalling) without any socket or wasm plumbing.
 //! - [`UdsTransport`] + [`serve`] (Unix only) are the first *real home*: the module runs
-//!   as an out-of-process peer behind a Unix-domain socket, and the host drives the same
-//!   session over framed socket I/O. Same loop, same issuer as the loopback — only the
-//!   pipe changed. A wasm/socket transport swaps the byte pipe without touching the
-//!   module or [`ModuleSpace`].
+//!   as an out-of-process peer behind a Unix-domain socket (peercred-guarded, same user),
+//!   and the host drives the same session over framed socket I/O. Same loop, same issuer
+//!   as the loopback — only the pipe changed. A wasm/socket transport swaps the byte pipe
+//!   without touching the module or [`ModuleSpace`].
 //!
 //! See `ikigai-cli/docs/module-format-design.md`.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`, so the UDS server's peercred check (and only it) can opt into the
+// `libc` FFI it needs via a scoped `#[allow(unsafe_code)]`; everything else stays unsafe-free.
+#![deny(unsafe_code)]
 
 use async_trait::async_trait;
 use futures::channel::mpsc;
@@ -385,10 +387,10 @@ impl Issuer for SessionHostIssuer {
 // the module-side issuer are the loopback's, byte-for-byte; only the pipe changed (framed
 // blocking socket I/O instead of `mpsc`). Unix only.
 //
-// Security is the operating system's: the socket is `0600` and meant to live in a
-// per-user `0700` directory (the caller's choice of path). peercred (refuse other UIDs,
-// as `ikigai-ipc` does) is a small follow-up — noted, not yet added, to keep this crate
-// free of `libc`.
+// Security is the operating system's: the socket is `0600`, meant for a per-user `0700`
+// directory (the caller's path), and `serve` refuses any peer whose kernel-verified UID
+// isn't the server's own user (`SO_PEERCRED` / `getpeereid`) — the same defense-in-depth
+// model as `ikigai-ipc`.
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -399,6 +401,7 @@ mod uds {
     use super::*;
     use std::io::{self, Read, Write};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
 
@@ -506,16 +509,67 @@ mod uds {
     /// the socket (replacing a stale one), restrict it to `0600`, and serve each
     /// connection on its own thread. The caller should place `path` in a per-user `0700`
     /// directory (see `ikigai-ipc::default_socket_path` for the convention).
+    ///
+    /// Each connection's kernel-verified peer UID is checked, and any peer that isn't the
+    /// server's own user is refused — defense in depth over the `0600`/`0700` filesystem
+    /// permissions (the same model `ikigai-ipc` uses). Capability-based authorization
+    /// (finer than per-user) layers on later.
     pub fn serve(space: Arc<dyn Space>, path: &Path) -> io::Result<()> {
         let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let me = own_uid();
         for stream in listener.incoming() {
             let stream = stream?;
+            if peer_uid(&stream) != Some(me) {
+                continue; // not our user — drop it
+            }
             let space = Arc::clone(&space);
             std::thread::spawn(move || serve_connection(space, stream));
         }
         Ok(())
+    }
+
+    /// This process's real user id.
+    #[allow(unsafe_code)]
+    pub(crate) fn own_uid() -> u32 {
+        // SAFETY: `getuid` reads a process attribute and cannot fail.
+        unsafe { libc::getuid() }
+    }
+
+    /// The connected peer's user id, kernel-verified — `None` if it can't be read.
+    /// (Linux reads `SO_PEERCRED`; macOS/BSD use `getpeereid`.)
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: a valid fd and correctly-sized out-params for SO_PEERCRED.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0).then_some(cred.uid)
+    }
+
+    /// The connected peer's user id (macOS/BSD use `getpeereid`).
+    #[cfg(not(target_os = "linux"))]
+    #[allow(unsafe_code)]
+    pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: a valid fd and two valid out-params.
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+        (rc == 0).then_some(uid)
     }
 
     /// Serve one connection: run a module session per `Invoke` until the peer hangs up.
@@ -939,6 +993,23 @@ mod tests {
         // The transport closed its connection after the session, so the server's read hits
         // EOF and the handler returns.
         server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_self_connection_reports_our_own_uid() {
+        // The peercred guard `serve` applies: a peer connecting from this same process
+        // reads back as our own UID, so it's admitted (and a different user would not be).
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = std::env::temp_dir()
+            .join(format!("ikigai-module-uid-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        assert_eq!(crate::uds::peer_uid(&server_side), Some(crate::uds::own_uid()));
+        drop(client);
         let _ = std::fs::remove_file(&path);
     }
 }
