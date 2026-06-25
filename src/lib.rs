@@ -248,8 +248,8 @@ impl Issuer for HostBridge<'_, '_> {
 mod tests {
     use super::*;
     use ikigai_core::{
-        ArgRef, Description, EndpointSpace, Exact, Fallback, FnEndpoint, Iri, Kernel, MetaRenderer,
-        ReprType, Verb,
+        ArgRef, ArgSpec, Description, EndpointSpace, Exact, Fallback, FnEndpoint, Iri, Kernel,
+        MetaRenderer, ReprType, Verb,
     };
     use futures::executor::block_on;
 
@@ -261,24 +261,51 @@ mod tests {
         }
     }
 
-    // The module's `src` and `stylesheet`, served BY THE HOST as cacheable resources —
-    // exactly the refs the module will reach back for.
-    const SRC_RDFXML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <Endpoint xmlns="https://ikigai-rs.dev/ns#" rdf:about="urn:ikigai:endpoint:toUpper">
-    <id>toUpper</id><title>Upper-case</title><summary>Upper-cases text.</summary>
-  </Endpoint>
-  <Endpoint xmlns="https://ikigai-rs.dev/ns#" rdf:about="urn:ikigai:endpoint:reverseList">
-    <id>reverseList</id><title>Reverse list</title><summary>Reverses items.</summary>
-  </Endpoint>
-</rdf:RDF>"#;
+    // A stand-in module endpoint — the smallest thing that exercises the module-format
+    // contract: it resolves TWO sub-resources (`a=` and `b=`) *back through the host
+    // kernel* (via `inv.source`, carried over the ModuleTransport) and joins them. That
+    // host callback is the whole point of the format, so the test owns a trivial endpoint
+    // rather than pulling in a concrete module crate just to stand one up.
+    struct ConcatEndpoint;
 
-    const CARDS_XSL: &str = r#"<xsl:stylesheet version="1.0"
-  xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
-  xmlns:ik="https://ikigai-rs.dev/ns#">
-  <xsl:template match="/"><div class="cards"><xsl:apply-templates select="//ik:Endpoint"/></div></xsl:template>
-  <xsl:template match="ik:Endpoint"><article class="card"><h3><xsl:value-of select="ik:title"/></h3></article></xsl:template>
-</xsl:stylesheet>"#;
+    #[async_trait]
+    impl Endpoint for ConcatEndpoint {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            let mut out = Vec::new();
+            for arg in ["a", "b"] {
+                let uri = inv.inline_str(arg).map_err(|_| {
+                    Error::Endpoint(format!("urn:stub:concat needs a `{arg}=<uri>` reference"))
+                })?;
+                let iri = Iri::parse(uri)
+                    .map_err(|e| Error::Endpoint(format!("bad resource IRI `{uri}`: {e}")))?;
+                // ← the host callback: resolved against the host kernel, over the transport.
+                out.extend_from_slice(&inv.source(&iri).await?.bytes);
+            }
+            // Cacheable, so the result inherits both sub-resources' golden threads —
+            // exactly the host-side caching a real module relies on.
+            Ok(Representation::new(ReprType::new("text/plain"), out).cacheable())
+        }
+
+        fn name(&self) -> &str {
+            "stub-concat"
+        }
+
+        fn describe(&self) -> Description {
+            Description::new("stub-concat")
+                .title("Concat (test stub)")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("a").summary("first resolvable resource IRI"))
+                .input(ArgSpec::new("b").summary("second resolvable resource IRI"))
+                .output("text/plain")
+        }
+    }
+
+    // The stub module's `space()` — bound only inside a ModuleSpace below, never linked
+    // into a local host space, so the ONLY way its endpoint resolves `a`/`b` is by
+    // calling back to the host.
+    fn stub_module() -> EndpointSpace {
+        EndpointSpace::new().bind(Exact::new("urn:stub:concat"), ConcatEndpoint)
+    }
 
     fn fixed(name: &'static str, media: &'static str, body: &'static str) -> FnEndpoint {
         FnEndpoint::new(name, move |_inv: &Invocation<'_>| {
@@ -287,17 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn module_endpoint_resolves_its_src_and_stylesheet_back_through_the_host() {
-        // Host space: the src + stylesheet resources the module will reach back for.
-        // The module (ikigai-xslt) is NOT linked into a local space — it's reached only
-        // through the ModuleSpace, over the InProcessTransport.
+    fn module_endpoint_resolves_its_refs_back_through_the_host() {
+        // Host space: the two resources the module will reach back for. The module is NOT
+        // linked into a local space — it's reached only through the ModuleSpace, over the
+        // InProcessTransport.
         let host_space = EndpointSpace::new()
-            .bind(Exact::new("urn:test:src.rdf"), fixed("src", "application/rdf+xml", SRC_RDFXML))
-            .bind(Exact::new("urn:test:cards.xsl"), fixed("xsl", "text/xml", CARDS_XSL));
+            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
+            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
 
         let module = ModuleSpace::new(
-            ["urn:xslt:"],
-            Arc::new(InProcessTransport::new(ikigai_xslt::space())),
+            ["urn:stub:"],
+            Arc::new(InProcessTransport::new(stub_module())),
         );
 
         let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
@@ -306,16 +333,14 @@ mod tests {
         ]));
         let kernel = Kernel::with_meta_renderer(root, Arc::new(PlainRenderer));
 
-        let request = Request::new(Verb::Source, Iri::parse("urn:xslt:transform").unwrap())
-            .with_arg("src", ArgRef::Inline(b"urn:test:src.rdf".to_vec()))
-            .with_arg("stylesheet", ArgRef::Inline(b"urn:test:cards.xsl".to_vec()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:stub:concat").unwrap())
+            .with_arg("a", ArgRef::Inline(b"urn:test:greeting".to_vec()))
+            .with_arg("b", ArgRef::Inline(b"urn:test:subject".to_vec()));
 
         let rep = block_on(kernel.issue(request, &Capability::root())).expect("module invoke");
-        let html = String::from_utf8(rep.bytes).unwrap();
 
-        // The XSLT ran in the "module", over data it pulled back from the host: two cards.
-        assert_eq!(html.matches("class='card'").count() + html.matches("class=\"card\"").count(), 2, "{html}");
-        assert!(html.contains("Upper-case") && html.contains("Reverse list"), "{html}");
+        // The module joined two resources it pulled back from the host.
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
     }
 
     #[test]
@@ -323,11 +348,11 @@ mod tests {
         // The module is a stateless leaf; the HOST kernel caches its result. Same query
         // twice ⇒ the second is served from cache (cache_len stays 1 for the top result).
         let host_space = EndpointSpace::new()
-            .bind(Exact::new("urn:test:src.rdf"), fixed("src", "application/rdf+xml", SRC_RDFXML))
-            .bind(Exact::new("urn:test:cards.xsl"), fixed("xsl", "text/xml", CARDS_XSL));
+            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
+            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
         let module = ModuleSpace::new(
-            ["urn:xslt:"],
-            Arc::new(InProcessTransport::new(ikigai_xslt::space())),
+            ["urn:stub:"],
+            Arc::new(InProcessTransport::new(stub_module())),
         );
         let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
             Arc::new(host_space) as Arc<dyn Space>,
@@ -335,9 +360,9 @@ mod tests {
         ]));
         let kernel = Kernel::with_meta_renderer(root, Arc::new(PlainRenderer));
         let req = || {
-            Request::new(Verb::Source, Iri::parse("urn:xslt:transform").unwrap())
-                .with_arg("src", ArgRef::Inline(b"urn:test:src.rdf".to_vec()))
-                .with_arg("stylesheet", ArgRef::Inline(b"urn:test:cards.xsl".to_vec()))
+            Request::new(Verb::Source, Iri::parse("urn:stub:concat").unwrap())
+                .with_arg("a", ArgRef::Inline(b"urn:test:greeting".to_vec()))
+                .with_arg("b", ArgRef::Inline(b"urn:test:subject".to_vec()))
         };
         let a = block_on(kernel.issue(req(), &Capability::root())).unwrap();
         assert!(kernel.is_cached(&req(), &Capability::root()), "module result is cacheable host-side");
