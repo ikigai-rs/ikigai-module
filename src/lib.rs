@@ -22,9 +22,12 @@
 //! - [`LoopbackTransport`] runs that session **through the codec** — every message is
 //!   `postcard`-encoded over an in-memory byte channel, both ends in-process — so it
 //!   proves the protocol (the session state machine + `Request`/`Capability`/
-//!   `Representation` marshalling) without any socket or wasm plumbing. A socket/wasm
-//!   transport swaps the channel for framed I/O without touching the module or
-//!   [`ModuleSpace`].
+//!   `Representation` marshalling) without any socket or wasm plumbing.
+//! - [`UdsTransport`] + [`serve`] (Unix only) are the first *real home*: the module runs
+//!   as an out-of-process peer behind a Unix-domain socket, and the host drives the same
+//!   session over framed socket I/O. Same loop, same issuer as the loopback — only the
+//!   pipe changed. A wasm/socket transport swaps the byte pipe without touching the
+//!   module or [`ModuleSpace`].
 //!
 //! See `ikigai-cli/docs/module-format-design.md`.
 
@@ -373,6 +376,227 @@ impl Issuer for SessionHostIssuer {
 }
 
 // ---------------------------------------------------------------------------
+// A real home: the session over a Unix-domain socket.
+//
+// `LoopbackTransport` runs the session over in-memory channels; this swaps those for a
+// socket. The module is an out-of-process peer: `serve` runs its `space()` behind a UDS,
+// and the host-side `UdsTransport` connects and drives the same session — send `Invoke`,
+// service each `HostCall` against the host kernel, receive `Resolved`. The host loop and
+// the module-side issuer are the loopback's, byte-for-byte; only the pipe changed (framed
+// blocking socket I/O instead of `mpsc`). Unix only.
+//
+// Security is the operating system's: the socket is `0600` and meant to live in a
+// per-user `0700` directory (the caller's choice of path). peercred (refuse other UIDs,
+// as `ikigai-ipc` does) is a small follow-up — noted, not yet added, to keep this crate
+// free of `libc`.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+pub use uds::{serve, UdsTransport};
+
+#[cfg(unix)]
+mod uds {
+    use super::*;
+    use std::io::{self, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+
+    /// Largest framed message accepted — guards the length header against a bogus
+    /// allocation. 64 MiB is far above any representation a module round-trips.
+    const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+    /// Write a `postcard`-encoded message length-prefixed (`u32` big-endian, then the
+    /// payload) — the same framing `ikigai-wire` uses, inlined to keep the dep off.
+    fn write_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::Result<()> {
+        let bytes = postcard::to_allocvec(message)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
+        writer.write_all(&len.to_be_bytes())?;
+        writer.write_all(&bytes)?;
+        writer.flush()
+    }
+
+    /// Read one length-prefixed `postcard` message (the counterpart to [`write_frame`]).
+    fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<T> {
+        let mut len = [0u8; 4];
+        reader.read_exact(&mut len)?;
+        let len = u32::from_be_bytes(len) as usize;
+        if len > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "framed message exceeds the size limit",
+            ));
+        }
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
+        postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    fn io_err(e: io::Error) -> Error {
+        Error::Endpoint(format!("module socket transport: {e}"))
+    }
+
+    /// A [`ModuleTransport`] that reaches a module served on a Unix socket. Each `invoke`
+    /// opens a connection, runs one session, and closes it (so concurrent invocations
+    /// never share a stream). The host-side loop is the loopback's, over framed socket I/O.
+    pub struct UdsTransport {
+        path: PathBuf,
+    }
+
+    impl UdsTransport {
+        /// A transport reaching the module server listening on `path`.
+        pub fn connect(path: impl Into<PathBuf>) -> Self {
+            Self { path: path.into() }
+        }
+    }
+
+    #[async_trait]
+    impl ModuleTransport for UdsTransport {
+        async fn invoke(
+            &self,
+            request: Request,
+            capability: &Capability,
+            host: &dyn Issuer,
+        ) -> Result<Representation> {
+            let mut stream = UnixStream::connect(&self.path).map_err(io_err)?;
+            let invoke = ModuleCall::Invoke {
+                request,
+                capability: capability.clone(),
+            };
+            write_frame(&mut stream, &invoke).map_err(io_err)?;
+            loop {
+                match read_frame::<_, ModuleReply>(&mut stream).map_err(io_err)? {
+                    ModuleReply::HostCall {
+                        request,
+                        capability: carried,
+                    } => {
+                        let clamped = capability.clamp(&carried);
+                        let result = host
+                            .issue(request, &clamped)
+                            .await
+                            .map_err(|e| e.to_string());
+                        write_frame(&mut stream, &ModuleCall::HostResult(result)).map_err(io_err)?;
+                    }
+                    ModuleReply::Resolved(representation) => return Ok(representation),
+                    ModuleReply::Error(message) => return Err(Error::Endpoint(message)),
+                    ModuleReply::Bindings(_) => {
+                        return Err(Error::Endpoint(
+                            "module sent Bindings in reply to Invoke".to_string(),
+                        ))
+                    }
+                }
+            }
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            // Ask the server over the wire (`Describe`); best-effort, so introspection of
+            // an unreachable module degrades to "no entries" rather than erroring.
+            let mut stream = UnixStream::connect(&self.path).ok()?;
+            write_frame(&mut stream, &ModuleCall::Describe).ok()?;
+            match read_frame::<_, ModuleReply>(&mut stream).ok()? {
+                ModuleReply::Bindings(entries) => entries,
+                _ => None,
+            }
+        }
+    }
+
+    /// Run `space` as a module server on `path` until an unrecoverable accept error: bind
+    /// the socket (replacing a stale one), restrict it to `0600`, and serve each
+    /// connection on its own thread. The caller should place `path` in a per-user `0700`
+    /// directory (see `ikigai-ipc::default_socket_path` for the convention).
+    pub fn serve(space: Arc<dyn Space>, path: &Path) -> io::Result<()> {
+        let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
+        let listener = UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        for stream in listener.incoming() {
+            let stream = stream?;
+            let space = Arc::clone(&space);
+            std::thread::spawn(move || serve_connection(space, stream));
+        }
+        Ok(())
+    }
+
+    /// Serve one connection: run a module session per `Invoke` until the peer hangs up.
+    /// `pub(crate)` so a test can drive a single accepted connection directly.
+    pub(crate) fn serve_connection(space: Arc<dyn Space>, stream: UnixStream) {
+        loop {
+            let call: ModuleCall = match read_frame(&mut &stream) {
+                Ok(call) => call,
+                Err(_) => return, // EOF or a malformed frame ends the session
+            };
+            let reply = match call {
+                ModuleCall::Invoke {
+                    request,
+                    capability,
+                } => futures::executor::block_on(run_session(&space, &stream, request, capability)),
+                ModuleCall::Describe => ModuleReply::Bindings(space.entries()),
+                ModuleCall::HostResult(_) => {
+                    ModuleReply::Error("server received HostResult before Invoke".to_string())
+                }
+            };
+            if write_frame(&mut &stream, &reply).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Resolve `request` in the module's space and run the endpoint under a
+    /// [`SocketHostIssuer`], so its `inv.source`/`inv.issue` round-trip as
+    /// `HostCall`/`HostResult` on `stream`.
+    async fn run_session(
+        space: &Arc<dyn Space>,
+        stream: &UnixStream,
+        request: Request,
+        capability: Capability,
+    ) -> ModuleReply {
+        match space.resolve(&request, &Scope::empty()) {
+            Resolution::Hit(resolved) => {
+                let issuer = SocketHostIssuer { stream };
+                let inv =
+                    Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
+                match resolved.endpoint.invoke(&inv).await {
+                    Ok(representation) => ModuleReply::Resolved(representation),
+                    Err(e) => ModuleReply::Error(e.to_string()),
+                }
+            }
+            Resolution::Miss => ModuleReply::Error(format!(
+                "module did not resolve {}",
+                request.target.as_str()
+            )),
+        }
+    }
+
+    /// The module end of the callback channel over a socket: emit a `HostCall` frame and
+    /// block on the next `HostResult` frame. The socket counterpart of the loopback's
+    /// `SessionHostIssuer`; callbacks are assumed sequential (the server reads the next
+    /// frame as the answer to the last `HostCall`).
+    struct SocketHostIssuer<'a> {
+        stream: &'a UnixStream,
+    }
+
+    #[async_trait]
+    impl Issuer for SocketHostIssuer<'_> {
+        async fn issue(&self, request: Request, capability: &Capability) -> Result<Representation> {
+            let call = ModuleReply::HostCall {
+                request,
+                capability: capability.clone(),
+            };
+            let mut stream = self.stream;
+            write_frame(&mut stream, &call).map_err(io_err)?;
+            match read_frame::<_, ModuleCall>(&mut stream).map_err(io_err)? {
+                ModuleCall::HostResult(Ok(representation)) => Ok(representation),
+                ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
+                _ => Err(Error::Endpoint(
+                    "expected HostResult answering a HostCall".to_string(),
+                )),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The host side.
 // ---------------------------------------------------------------------------
 
@@ -667,5 +891,54 @@ mod tests {
             }
             other => panic!("expected Bindings, got {other:?}"),
         }
+    }
+
+    // --- UdsTransport: the same session, but over a real Unix socket -------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn module_session_round_trips_over_a_unix_socket() {
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let path = std::env::temp_dir()
+            .join(format!("ikigai-module-uds-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Module server: the stub space, served on one accepted connection on its own thread.
+        let listener = UnixListener::bind(&path).unwrap();
+        let space: Arc<dyn Space> = Arc::new(stub_module());
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            crate::uds::serve_connection(space, stream);
+        });
+
+        // Host kernel: urn:stub:* routed to the module over the socket; the two refs it
+        // pulls back live only on the host.
+        let host_space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
+            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
+        let module = ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(crate::uds::UdsTransport::connect(&path)),
+        );
+        let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
+            Arc::new(host_space) as Arc<dyn Space>,
+            Arc::new(module) as Arc<dyn Space>,
+        ]));
+        let kernel = Kernel::with_meta_renderer(root, Arc::new(PlainRenderer));
+
+        // A correct result means Invoke + two HostCalls + two HostResults + Resolved all
+        // crossed the socket as framed postcard messages, and the module's `inv.source`
+        // calls resolved back on the host kernel.
+        let rep = block_on(kernel.issue(concat_request(), &Capability::root())).expect("uds invoke");
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
+        // Cached host-side via the callbacks' provenance, exactly as the other transports.
+        assert!(kernel.is_cached(&concat_request(), &Capability::root()));
+
+        // The transport closed its connection after the session, so the server's read hits
+        // EOF and the handler returns.
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }
