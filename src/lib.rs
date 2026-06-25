@@ -26,8 +26,11 @@
 //! - [`UdsTransport`] + [`serve`] (Unix only) are the first *real home*: the module runs
 //!   as an out-of-process peer behind a Unix-domain socket (peercred-guarded, same user),
 //!   and the host drives the same session over framed socket I/O. Same loop, same issuer
-//!   as the loopback — only the pipe changed. A wasm/socket transport swaps the byte pipe
-//!   without touching the module or [`ModuleSpace`].
+//!   as the loopback — only the pipe changed.
+//! - [`run_session`] is the transport-agnostic *module side* on its own: given the host's
+//!   encoded `Invoke` and a closure that pumps one `HostCall`→`HostResult` exchange, it
+//!   runs the endpoint and returns the encoded reply. The caller supplies the pump, so a
+//!   wasm host can drive a module over a JS byte-channel without this crate touching wasm.
 //!
 //! See `ikigai-cli/docs/module-format-design.md`.
 
@@ -368,6 +371,99 @@ impl Issuer for SessionHostIssuer {
                 .ok_or_else(|| Error::Endpoint("host closed the session".to_string()))?
         };
         match decode::<ModuleCall>(&bytes)? {
+            ModuleCall::HostResult(Ok(representation)) => Ok(representation),
+            ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
+            _ => Err(Error::Endpoint(
+                "expected HostResult answering a HostCall".to_string(),
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The transport-agnostic module side of the session.
+//
+// `LoopbackTransport` and the UDS server each carry the session over a specific pipe
+// (channels, a socket) and own both ends. `run_session` is the *module side* on its own:
+// given the host's encoded `Invoke` and a `host_call` that pumps one `HostCall`→`HostResult`
+// exchange, it runs the endpoint and returns the encoded final `ModuleReply`. The caller
+// supplies the pump, so the same module logic runs over any transport — in particular a
+// browser, where the pump is a JS byte-channel and `host_call` bridges the `!Send` JS call
+// (spawn_local + oneshot) to the `Send` future the issuer needs.
+//
+// (The loopback/UDS transports predate this and keep their own inline session loops;
+// folding them onto `run_session` is a possible later tidy-up.)
+// ---------------------------------------------------------------------------
+
+/// Run one module session from the host's encoded [`ModuleCall::Invoke`] (`invoke`),
+/// pumping each of the module's sub-resource callbacks through `host_call`, and return the
+/// encoded final [`ModuleReply`] (`Resolved` / `Error`, or `Bindings` for a `Describe`).
+///
+/// `host_call` receives the encoded [`ModuleReply::HostCall`] and returns the host's
+/// encoded [`ModuleCall::HostResult`] — i.e. one turn of the byte pump, exactly what a
+/// channel/socket/JS transport carries. It yields a `Send` future (the wasm caller bridges
+/// any `!Send` JS work behind a `spawn_local` + `oneshot` at that boundary).
+///
+/// Callbacks are assumed sequential (the module awaits each `inv.source` before the next),
+/// matching the `ikigai-xslt` pilot.
+pub async fn run_session<F, Fut>(space: &Arc<dyn Space>, invoke: &[u8], host_call: F) -> Vec<u8>
+where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync,
+    Fut: core::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send,
+{
+    let reply = match decode::<ModuleCall>(invoke) {
+        Ok(ModuleCall::Invoke {
+            request,
+            capability,
+        }) => match space.resolve(&request, &Scope::empty()) {
+            Resolution::Hit(resolved) => {
+                let issuer = ClosureHostIssuer { host_call: &host_call };
+                let inv =
+                    Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
+                match resolved.endpoint.invoke(&inv).await {
+                    Ok(representation) => ModuleReply::Resolved(representation),
+                    Err(e) => ModuleReply::Error(e.to_string()),
+                }
+            }
+            Resolution::Miss => ModuleReply::Error(format!(
+                "module did not resolve {}",
+                request.target.as_str()
+            )),
+        },
+        Ok(ModuleCall::Describe) => ModuleReply::Bindings(space.entries()),
+        Ok(ModuleCall::HostResult(_)) => {
+            ModuleReply::Error("module received HostResult before Invoke".to_string())
+        }
+        Err(e) => ModuleReply::Error(e.to_string()),
+    };
+    // Encoding a Representation/SpaceEntry shouldn't fail; if it somehow does, still hand
+    // back a decodable `ModuleReply::Error` rather than empty bytes.
+    encode(&reply).unwrap_or_else(|_| {
+        encode(&ModuleReply::Error("module reply encode failed".to_string())).unwrap_or_default()
+    })
+}
+
+/// The module's [`Issuer`] for [`run_session`]: turn each sub-request into an encoded
+/// `HostCall`, pump it through the host's closure, and decode the `HostResult`.
+struct ClosureHostIssuer<'a, F> {
+    host_call: &'a F,
+}
+
+#[async_trait]
+impl<F, Fut> Issuer for ClosureHostIssuer<'_, F>
+where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync,
+    Fut: core::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send,
+{
+    async fn issue(&self, request: Request, capability: &Capability) -> Result<Representation> {
+        let host_call = ModuleReply::HostCall {
+            request,
+            capability: capability.clone(),
+        };
+        let answer = (self.host_call)(encode(&host_call)?)
+            .await
+            .map_err(Error::Endpoint)?;
+        match decode::<ModuleCall>(&answer)? {
             ModuleCall::HostResult(Ok(representation)) => Ok(representation),
             ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
             _ => Err(Error::Endpoint(
@@ -944,6 +1040,53 @@ mod tests {
                 );
             }
             other => panic!("expected Bindings, got {other:?}"),
+        }
+    }
+
+    // --- run_session: the generic module side, driven by a closure pump ----------------
+
+    #[test]
+    fn run_session_pumps_host_calls_through_a_closure() {
+        // The closure is the byte pump a real transport provides — it decodes each HostCall,
+        // resolves it on a host kernel, and encodes the HostResult. This is the exact shape
+        // the browser uses, with a JS byte-channel as the pump.
+        let host_space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
+            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
+        let host_kernel = Arc::new(Kernel::with_meta_renderer(
+            Arc::new(host_space) as Arc<dyn Space>,
+            Arc::new(PlainRenderer),
+        ));
+        let module: Arc<dyn Space> = Arc::new(stub_module());
+
+        let invoke = encode(&ModuleCall::Invoke {
+            request: concat_request(),
+            capability: Capability::root(),
+        })
+        .unwrap();
+
+        let host_call = move |reply_bytes: Vec<u8>| {
+            let host_kernel = Arc::clone(&host_kernel);
+            async move {
+                match decode::<ModuleReply>(&reply_bytes).map_err(|e| e.to_string())? {
+                    ModuleReply::HostCall { request, capability } => {
+                        let result = host_kernel
+                            .issue(request, &capability)
+                            .await
+                            .map_err(|e| e.to_string());
+                        encode(&ModuleCall::HostResult(result)).map_err(|e| e.to_string())
+                    }
+                    _ => Err("expected HostCall".to_string()),
+                }
+            }
+        };
+
+        let reply_bytes = block_on(run_session(&module, &invoke, host_call));
+        match decode::<ModuleReply>(&reply_bytes).unwrap() {
+            ModuleReply::Resolved(rep) => {
+                assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module")
+            }
+            other => panic!("expected Resolved, got {other:?}"),
         }
     }
 
