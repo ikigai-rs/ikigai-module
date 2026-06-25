@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-module"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -13,6 +13,8 @@ keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 ikigai-core = "0.1.21"  # needs the public Invocation::with_issuer (the module seam)
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
+# The loopback transport runs the ModuleCall/ModuleReply session over in-memory byte
+# channels: futures for the channels + lock + join!, postcard for the codec (the same
+# postcard framing ikigai-wire uses; `alloc` keeps it wasm-clean).
 futures = "0.3"
+postcard = { version = "1", features = ["alloc"] }

@@ -17,19 +17,28 @@
 //!   request in the module's space and invokes the endpoint **with the host as its
 //!   issuer** — so the endpoint's `inv.source`/`inv.issue` cross back to the host
 //!   kernel, exercising the full callback machinery with zero transport risk.
-//! - [`ModuleCall`] / [`ModuleReply`] define the *wire session* a Phase-2 transport
-//!   (a second wasm instance, or an embedded wasmtime, or a socket) marshals — kept
-//!   here so the protocol is pinned even though the in-process transport calls directly.
+//! - [`ModuleCall`] / [`ModuleReply`] define the *wire session* a real transport
+//!   (a second wasm instance, or an embedded wasmtime, or a socket) marshals.
+//! - [`LoopbackTransport`] runs that session **through the codec** — every message is
+//!   `postcard`-encoded over an in-memory byte channel, both ends in-process — so it
+//!   proves the protocol (the session state machine + `Request`/`Capability`/
+//!   `Representation` marshalling) without any socket or wasm plumbing. A socket/wasm
+//!   transport swaps the channel for framed I/O without touching the module or
+//!   [`ModuleSpace`].
 //!
 //! See `ikigai-cli/docs/module-format-design.md`.
 
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use futures::channel::mpsc;
+use futures::lock::Mutex as AsyncMutex;
+use futures::StreamExt;
 use ikigai_core::{
     Bindings, Capability, Endpoint, Error, Invocation, Issuer, Representation, Request, Resolution,
     Resolved, Result, Scope, Space, SpaceEntry,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -147,6 +156,219 @@ impl ModuleTransport for InProcessTransport {
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         self.space.entries()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The serialized session transport.
+//
+// `InProcessTransport` proves the *callback machinery* but shortcuts the wire — it calls
+// the module's endpoint directly, so `ModuleCall`/`ModuleReply` are never serialized.
+// `LoopbackTransport` runs the **full session through the codec**: every `Invoke`,
+// `HostCall`, `HostResult`, and `Resolved` is `postcard`-encoded and sent over an
+// in-memory byte channel, exactly as a socket or wasm transport will frame it. Both ends
+// live in this process (no socket, no second runtime), so it isolates the protocol — the
+// session state machine and `Request`/`Capability`/`Representation` marshalling — from the
+// transport plumbing a real home adds. It's the foundation those homes build on.
+// ---------------------------------------------------------------------------
+
+/// Encode a module-protocol message to `postcard` bytes — the same codec (and on-wire
+/// bytes) `ikigai-wire` frames for the kernel `Call`/`Reply` protocol.
+fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
+    postcard::to_allocvec(message)
+        .map_err(|e| Error::Endpoint(format!("module-protocol encode failed: {e}")))
+}
+
+/// Decode a module-protocol message from a complete `postcard` byte slice.
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    postcard::from_bytes(bytes)
+        .map_err(|e| Error::Endpoint(format!("module-protocol decode failed: {e}")))
+}
+
+/// A [`ModuleTransport`] that runs the `ModuleCall`/`ModuleReply` session over a pair of
+/// in-memory byte channels, serializing every message with [`encode`]/[`decode`]. Same
+/// protocol and bytes as a real (socket/wasm) transport, both ends in-process — so it
+/// proves the session without any I/O risk.
+///
+/// Host callbacks are assumed **sequential** (the module awaits each `inv.source` before
+/// the next), which matches the pilot (`ikigai-xslt`); concurrent callbacks from one
+/// module invocation are an open question (see the design doc).
+pub struct LoopbackTransport {
+    space: Arc<dyn Space>,
+}
+
+impl LoopbackTransport {
+    /// Wrap a module's `space()` as a serialized loopback transport.
+    pub fn new(space: impl Space + 'static) -> Self {
+        Self {
+            space: Arc::new(space),
+        }
+    }
+
+    /// Wrap an already-`Arc`'d space.
+    pub fn from_arc(space: Arc<dyn Space>) -> Self {
+        Self { space }
+    }
+}
+
+#[async_trait]
+impl ModuleTransport for LoopbackTransport {
+    async fn invoke(
+        &self,
+        request: Request,
+        capability: &Capability,
+        host: &dyn Issuer,
+    ) -> Result<Representation> {
+        // Two one-way byte channels — the in-memory stand-in for a socket's read/write
+        // halves. `host_to_module` carries `ModuleCall`s, `module_to_host` carries
+        // `ModuleReply`s.
+        let (host_to_module_tx, host_to_module_rx) = mpsc::unbounded::<Vec<u8>>();
+        let (module_to_host_tx, mut module_to_host_rx) = mpsc::unbounded::<Vec<u8>>();
+
+        // The module side: decode the `Invoke`, run the endpoint under a remote issuer
+        // that round-trips each `inv.source` as a `HostCall`/`HostResult`.
+        let module_side =
+            run_module_session(Arc::clone(&self.space), host_to_module_rx, module_to_host_tx);
+
+        // The host side: send the `Invoke`, then service each `HostCall` against the host
+        // kernel (re-clamping the carried capability to the session — a module may only
+        // ever narrow) until the module replies `Resolved`/`Error`.
+        let host_side = async {
+            let invoke = ModuleCall::Invoke {
+                request,
+                capability: capability.clone(),
+            };
+            send(&host_to_module_tx, &invoke)?;
+            loop {
+                let bytes = module_to_host_rx
+                    .next()
+                    .await
+                    .ok_or_else(|| Error::Endpoint("module closed the session early".to_string()))?;
+                match decode::<ModuleReply>(&bytes)? {
+                    ModuleReply::HostCall {
+                        request,
+                        capability: carried,
+                    } => {
+                        let clamped = capability.clamp(&carried);
+                        let result = host
+                            .issue(request, &clamped)
+                            .await
+                            .map_err(|e| e.to_string());
+                        send(&host_to_module_tx, &ModuleCall::HostResult(result))?;
+                    }
+                    ModuleReply::Resolved(representation) => return Ok(representation),
+                    ModuleReply::Error(message) => return Err(Error::Endpoint(message)),
+                    ModuleReply::Bindings(_) => {
+                        return Err(Error::Endpoint(
+                            "module sent Bindings in reply to Invoke".to_string(),
+                        ))
+                    }
+                }
+            }
+        };
+
+        // Drive both halves concurrently on whatever executor runs `invoke` (no spawner
+        // needed — pure future composition, single-thread/wasm-friendly). The module side
+        // returns once it has sent its final reply; the host side yields the answer.
+        let (_module_done, result) = futures::join!(module_side, host_side);
+        result
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        // `entries()` is synchronous; the loopback's space is local, so answer it directly.
+        // (The `ModuleCall::Describe` path exists for transports that can't — a real
+        // wasm/socket module answers introspection over the wire; see the tests.)
+        self.space.entries()
+    }
+}
+
+/// Send a `postcard`-encoded message down a byte channel.
+fn send<T: Serialize>(tx: &mpsc::UnboundedSender<Vec<u8>>, message: &T) -> Result<()> {
+    tx.unbounded_send(encode(message)?)
+        .map_err(|_| Error::Endpoint("module session channel closed".to_string()))
+}
+
+/// The module side of the session: read one `ModuleCall`, act on it, and send back the
+/// matching `ModuleReply`. For `Invoke`, the endpoint runs under a [`SessionHostIssuer`]
+/// whose `issue` emits a `HostCall` and awaits the next `HostResult` — so the module's
+/// `inv.source`/`inv.issue` cross the (serialized) channel back to the host kernel.
+async fn run_module_session(
+    space: Arc<dyn Space>,
+    mut from_host: mpsc::UnboundedReceiver<Vec<u8>>,
+    to_host: mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let Some(first) = from_host.next().await else {
+        return; // host hung up before sending anything
+    };
+    let reply = match decode::<ModuleCall>(&first) {
+        Ok(ModuleCall::Invoke {
+            request,
+            capability,
+        }) => match space.resolve(&request, &Scope::empty()) {
+            Resolution::Hit(resolved) => {
+                // The issuer now owns the receiver: after `Invoke`, every inbound message
+                // is a `HostResult` answering one of its `HostCall`s.
+                let issuer = SessionHostIssuer {
+                    to_host: to_host.clone(),
+                    from_host: AsyncMutex::new(from_host),
+                };
+                let inv =
+                    Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
+                match resolved.endpoint.invoke(&inv).await {
+                    Ok(representation) => ModuleReply::Resolved(representation),
+                    Err(e) => ModuleReply::Error(e.to_string()),
+                }
+            }
+            Resolution::Miss => ModuleReply::Error(format!(
+                "module did not resolve {}",
+                request.target.as_str()
+            )),
+        },
+        Ok(ModuleCall::Describe) => ModuleReply::Bindings(space.entries()),
+        Ok(ModuleCall::HostResult(_)) => {
+            ModuleReply::Error("module received HostResult before Invoke".to_string())
+        }
+        Err(e) => ModuleReply::Error(e.to_string()),
+    };
+    // Best-effort: if the host has already gone, there's no one to tell.
+    if let Ok(bytes) = encode(&reply) {
+        let _ = to_host.unbounded_send(bytes);
+    }
+}
+
+/// The module end of the callback channel: an [`Issuer`] that turns each sub-request into
+/// a `HostCall` on the wire and blocks on the matching `HostResult`. The mirror of the
+/// host-side [`HostBridge`] — together they make `inv.source` inside a module resolve on
+/// the host kernel across the (serialized) transport.
+struct SessionHostIssuer {
+    to_host: mpsc::UnboundedSender<Vec<u8>>,
+    from_host: AsyncMutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+}
+
+#[async_trait]
+impl Issuer for SessionHostIssuer {
+    async fn issue(&self, request: Request, capability: &Capability) -> Result<Representation> {
+        let call = ModuleReply::HostCall {
+            request,
+            capability: capability.clone(),
+        };
+        send(&self.to_host, &call)?;
+        // Await the host's answer. Callbacks are sequential, so this lock is uncontended;
+        // holding it across the await is sound (a `futures` async mutex).
+        let bytes = {
+            let mut from_host = self.from_host.lock().await;
+            from_host
+                .next()
+                .await
+                .ok_or_else(|| Error::Endpoint("host closed the session".to_string()))?
+        };
+        match decode::<ModuleCall>(&bytes)? {
+            ModuleCall::HostResult(Ok(representation)) => Ok(representation),
+            ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
+            _ => Err(Error::Endpoint(
+                "expected HostResult answering a HostCall".to_string(),
+            )),
+        }
     }
 }
 
@@ -368,5 +590,82 @@ mod tests {
         assert!(kernel.is_cached(&req(), &Capability::root()), "module result is cacheable host-side");
         let b = block_on(kernel.issue(req(), &Capability::root())).unwrap();
         assert_eq!(a.bytes, b.bytes);
+    }
+
+    // --- LoopbackTransport: the same stub, but the session runs through the codec --------
+
+    fn concat_request() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:stub:concat").unwrap())
+            .with_arg("a", ArgRef::Inline(b"urn:test:greeting".to_vec()))
+            .with_arg("b", ArgRef::Inline(b"urn:test:subject".to_vec()))
+    }
+
+    // Host space + a module routed over `transport`, as one root space.
+    fn root_over(transport: impl ModuleTransport + 'static) -> Arc<dyn Space> {
+        let host_space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
+            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
+        let module = ModuleSpace::new(["urn:stub:"], Arc::new(transport) as Arc<dyn ModuleTransport>);
+        Arc::new(Fallback::new(vec![
+            Arc::new(host_space) as Arc<dyn Space>,
+            Arc::new(module) as Arc<dyn Space>,
+        ]))
+    }
+
+    #[test]
+    fn loopback_runs_the_full_serialized_session() {
+        // Same stub, but every Invoke / HostCall / HostResult / Resolved is postcard-encoded
+        // over a byte channel. A correct "hello, module" proves the session state machine ran
+        // and that Request, Capability, and Representation all round-tripped through the codec.
+        let kernel =
+            Kernel::with_meta_renderer(root_over(LoopbackTransport::new(stub_module())), Arc::new(PlainRenderer));
+        let rep = block_on(kernel.issue(concat_request(), &Capability::root())).expect("loopback invoke");
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
+    }
+
+    #[test]
+    fn loopback_result_is_cached_via_callback_provenance() {
+        // The two HostCalls resolve through the host kernel (recorded on the *outer*
+        // invocation), so the serialized transform inherits their cacheability and is cached
+        // host-side — exactly as the in-process transport. Provenance rides the callbacks,
+        // not the serialized `Resolved` (whose threads are `serde(skip)`).
+        let kernel =
+            Kernel::with_meta_renderer(root_over(LoopbackTransport::new(stub_module())), Arc::new(PlainRenderer));
+        let a = block_on(kernel.issue(concat_request(), &Capability::root())).unwrap();
+        assert!(
+            kernel.is_cached(&concat_request(), &Capability::root()),
+            "loopback result is cacheable host-side"
+        );
+        let b = block_on(kernel.issue(concat_request(), &Capability::root())).unwrap();
+        assert_eq!(a.bytes, b.bytes);
+    }
+
+    #[test]
+    fn loopback_describe_round_trips_the_module_bindings() {
+        // The Describe arm: send a `Describe`, get back `Bindings` carrying the module's bound
+        // IRIs — so `urn:kernel:catalog` stays whole when a module answers introspection over
+        // a real (wasm/socket) transport that can't call `entries()` synchronously.
+        let (host_to_module_tx, host_to_module_rx) = mpsc::unbounded::<Vec<u8>>();
+        let (module_to_host_tx, mut module_to_host_rx) = mpsc::unbounded::<Vec<u8>>();
+        host_to_module_tx
+            .unbounded_send(encode(&ModuleCall::Describe).unwrap())
+            .unwrap();
+        block_on(run_module_session(
+            Arc::new(stub_module()),
+            host_to_module_rx,
+            module_to_host_tx,
+        ));
+        let reply: ModuleReply = decode(&block_on(module_to_host_rx.next()).unwrap()).unwrap();
+        match reply {
+            ModuleReply::Bindings(entries) => {
+                let patterns: Vec<String> =
+                    entries.unwrap_or_default().into_iter().map(|e| e.pattern).collect();
+                assert!(
+                    patterns.iter().any(|p| p == "urn:stub:concat"),
+                    "expected urn:stub:concat in bindings, got {patterns:?}"
+                );
+            }
+            other => panic!("expected Bindings, got {other:?}"),
+        }
     }
 }
