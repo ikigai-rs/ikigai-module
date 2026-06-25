@@ -31,6 +31,10 @@
 //!   encoded `Invoke` and a closure that pumps one `HostCall`→`HostResult` exchange, it
 //!   runs the endpoint and returns the encoded reply. The caller supplies the pump, so a
 //!   wasm host can drive a module over a JS byte-channel without this crate touching wasm.
+//! - [`wasm_module!`] + [`WasmModuleSpace`] / [`serve_host_call`] make a lazy *browser*
+//!   module nearly free: the macro emits a module's cdylib glue (one line per artifact), and
+//!   the host registers it with one `WasmModuleSpace::new` + a `serve_host_call` in its
+//!   `hostCall` export — no hand-written wrapper crate or per-module endpoint.
 //!
 //! See `ikigai-cli/docs/module-format-design.md`.
 
@@ -43,9 +47,11 @@ use futures::channel::mpsc;
 use futures::lock::Mutex as AsyncMutex;
 use futures::StreamExt;
 use ikigai_core::{
-    Bindings, Capability, Endpoint, Error, Invocation, Issuer, Representation, Request, Resolution,
-    Resolved, Result, Scope, Space, SpaceEntry,
+    Bindings, Capability, Description, Endpoint, Error, Expiry, Invocation, Issuer, Representation,
+    Request, Resolution, Resolved, Result, Scope, Space, SpaceEntry, Thread,
 };
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -471,6 +477,271 @@ where
             )),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Browser host support: a generic WasmModuleSpace + out-of-band HostCall servicing.
+//
+// The native transports (loopback, UDS) drive the HostCall loop *in-band*: the host owns
+// the channel, services each HostCall as it arrives, and records its provenance on the
+// outer invocation. A browser can't — a wasm module's JS imports are *global*, so the
+// module's HostCalls go to a global `hostCall` the host exports, NOT back through the call
+// the host made. So the browser pattern splits in two, joined by a per-transform sink:
+//   * `WasmModuleSpace` drives `invoke_session` (over a host-supplied [`ModuleSessionTransport`])
+//     and folds the sink into the result;
+//   * `serve_host_call` (called by the host's global `hostCall`) resolves each HostCall and
+//     records it into the active sink.
+// Both are plain Rust — the host wraps the actual (wasm-bindgen) JS calls. The
+// `wasm_module!` macro generates the matching module-side glue. So a new lazy module costs:
+// one `wasm_module!(space)` (its artifact) + one `WasmModuleSpace::new(..)` (the host
+// binding) — no hand-written crate or endpoint.
+// ---------------------------------------------------------------------------
+
+/// How a [`WasmModuleSpace`] reaches its module: run one session, given the encoded
+/// `Invoke`, returning the encoded `ModuleReply`. The host wraps the actual call (e.g. a
+/// lazy-loaded wasm instance's `invoke_session` over a JS shim); the module pumps its
+/// `HostCall`s to the global the host serves with [`serve_host_call`] while this awaits.
+#[async_trait]
+pub trait ModuleSessionTransport: Send + Sync {
+    /// Run the module session for `invoke` (an encoded [`ModuleCall::Invoke`]) and return
+    /// the encoded final [`ModuleReply`].
+    async fn invoke_session(&self, invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String>;
+}
+
+/// The cache provenance accumulated from one transform's out-of-band `HostCall`s, so the
+/// host can fold it into the transform's result (the module's `Resolved` drops its threads
+/// on the wire — `Representation::threads` is `serde(skip)` — so they're captured here).
+#[derive(Default)]
+struct DepSink {
+    threads: BTreeSet<Thread>,
+    expiry: Option<Expiry>,
+}
+
+impl DepSink {
+    fn record(&mut self, representation: &Representation) {
+        self.expiry = Some(match self.expiry {
+            Some(e) => e.most_restrictive(representation.expiry),
+            None => representation.expiry,
+        });
+        self.threads
+            .extend(representation.threads().iter().cloned());
+    }
+}
+
+thread_local! {
+    // Sinks of all in-flight WasmModuleSpace invocations on this (single-threaded) host,
+    // keyed by id so an invocation holds only the `u64` across its await (not a `!Send`
+    // handle). `serve_host_call` records into every active sink; nesting just
+    // over-approximates dependencies, which is safe.
+    static DEP_SINKS: RefCell<Vec<(u64, RefCell<DepSink>)>> = const { RefCell::new(Vec::new()) };
+    static NEXT_SINK_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+fn install_sink() -> u64 {
+    let id = NEXT_SINK_ID.with(|c| {
+        let id = c.get();
+        c.set(id.wrapping_add(1));
+        id
+    });
+    DEP_SINKS.with(|s| s.borrow_mut().push((id, RefCell::new(DepSink::default()))));
+    id
+}
+
+fn take_sink(id: u64) -> DepSink {
+    DEP_SINKS.with(|s| {
+        let mut sinks = s.borrow_mut();
+        match sinks.iter().position(|(sid, _)| *sid == id) {
+            Some(pos) => sinks.remove(pos).1.into_inner(),
+            None => DepSink::default(),
+        }
+    })
+}
+
+/// Service one out-of-band `HostCall` for a module session: decode the host call, resolve
+/// the sub-request via `resolve` (the host kernel), record its provenance against every
+/// in-flight [`WasmModuleSpace`] invocation, and return the encoded `HostResult` (`Ok` or
+/// `Err` — either is a decodable answer). The host's global `hostCall` export calls this.
+pub async fn serve_host_call<F, Fut>(reply: &[u8], resolve: F) -> Vec<u8>
+where
+    F: FnOnce(Request, Capability) -> Fut,
+    Fut: core::future::Future<Output = std::result::Result<Representation, String>>,
+{
+    let result = match decode::<ModuleReply>(reply) {
+        Ok(ModuleReply::HostCall {
+            request,
+            capability,
+        }) => match resolve(request, capability).await {
+            Ok(representation) => {
+                DEP_SINKS.with(|sinks| {
+                    for (_, sink) in sinks.borrow().iter() {
+                        sink.borrow_mut().record(&representation);
+                    }
+                });
+                Ok(representation)
+            }
+            Err(message) => Err(message),
+        },
+        Ok(_) => Err("serve_host_call: expected a HostCall".to_string()),
+        Err(e) => Err(format!("serve_host_call: undecodable HostCall: {e}")),
+    };
+    encode(&ModuleCall::HostResult(result)).unwrap_or_default()
+}
+
+/// A host-side [`Space`] that routes IRIs (by prefix) to a module reached over a
+/// [`ModuleSessionTransport`] — the browser counterpart of [`ModuleSpace`], for a module
+/// whose `HostCall`s come back out-of-band (serviced by [`serve_host_call`]). It encodes the
+/// invocation's request as a `ModuleCall::Invoke`, runs the session, and folds the
+/// dependency provenance the host collected into the result. Construct it with the module's
+/// [`Description`] so its endpoint still shows a rich card in the catalog.
+pub struct WasmModuleSpace {
+    prefixes: Vec<String>,
+    transport: Arc<dyn ModuleSessionTransport>,
+    describe: Description,
+}
+
+impl WasmModuleSpace {
+    /// Route every IRI starting with one of `prefixes` to `transport`; `describe` is the
+    /// module endpoint's self-description (for `Meta` / the catalog).
+    pub fn new(
+        prefixes: impl IntoIterator<Item = impl Into<String>>,
+        transport: Arc<dyn ModuleSessionTransport>,
+        describe: Description,
+    ) -> Self {
+        Self {
+            prefixes: prefixes.into_iter().map(Into::into).collect(),
+            transport,
+            describe,
+        }
+    }
+}
+
+impl Space for WasmModuleSpace {
+    fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
+        let target = request.target.as_str();
+        if self.prefixes.iter().any(|p| target.starts_with(p.as_str())) {
+            Resolution::Hit(Resolved {
+                endpoint: Arc::new(WasmModuleEndpoint {
+                    transport: Arc::clone(&self.transport),
+                    describe: self.describe.clone(),
+                }),
+                bindings: Bindings::new(),
+            })
+        } else {
+            Resolution::Miss
+        }
+    }
+}
+
+/// The endpoint a [`WasmModuleSpace`] resolves to: drive the session over the transport and
+/// fold the out-of-band callbacks' provenance into the result.
+struct WasmModuleEndpoint {
+    transport: Arc<dyn ModuleSessionTransport>,
+    describe: Description,
+}
+
+#[async_trait]
+impl Endpoint for WasmModuleEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let invoke = encode(&ModuleCall::Invoke {
+            request: inv.request.clone(),
+            capability: inv.capability.clone(),
+        })?;
+        // Install a sink so each `serve_host_call` records what it resolved; take it before
+        // `?` so it's cleaned up even on failure. Only the `u64` id crosses the await.
+        let sink_id = install_sink();
+        let result = self.transport.invoke_session(invoke).await;
+        let collected = take_sink(sink_id);
+        let reply_bytes = result.map_err(Error::Endpoint)?;
+
+        match decode::<ModuleReply>(&reply_bytes)? {
+            ModuleReply::Resolved(representation) => {
+                // Re-attach the provenance the wire dropped, no more cacheable than inputs.
+                let expiry = match collected.expiry {
+                    Some(dep) => representation.expiry.most_restrictive(dep),
+                    None => representation.expiry,
+                };
+                let mut representation = representation.with_expiry(expiry);
+                for thread in collected.threads {
+                    representation = representation.depends_on(thread);
+                }
+                Ok(representation)
+            }
+            ModuleReply::Error(message) => Err(Error::Endpoint(message)),
+            _ => Err(Error::Endpoint(
+                "module returned an unexpected reply to Invoke".to_string(),
+            )),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "wasm-module"
+    }
+
+    fn describe(&self) -> Description {
+        self.describe.clone()
+    }
+}
+
+/// Generate the wasm-bindgen glue that makes a module's `space()` a standalone, lazily
+/// loadable artifact — so a new module is one macro line, not a hand-written crate. Emits a
+/// public `invoke_session(Vec<u8>) -> Vec<u8>` (async) that runs [`run_session`] over the
+/// given space, plus the `hostCall` import and the `!Send`→`Send` bridge it needs.
+///
+/// Use it in a `cdylib` crate that depends on `ikigai-module`, `ikigai-core`, `wasm-bindgen`,
+/// `wasm-bindgen-futures`, `js-sys`, and `futures`, with `use wasm_bindgen::prelude::*;` in
+/// scope:
+///
+/// ```ignore
+/// ikigai_module::wasm_module!(ikigai_xslt::space);
+/// ```
+#[macro_export]
+macro_rules! wasm_module {
+    ($space:path) => {
+        /// Run one module session: the host hands the encoded `Invoke` and gets back the
+        /// encoded `ModuleReply`. The module pumps its sub-resource callbacks to the host's
+        /// `hostCall` global while this awaits.
+        #[::wasm_bindgen::prelude::wasm_bindgen]
+        pub async fn invoke_session(invoke: ::std::vec::Vec<u8>) -> ::std::vec::Vec<u8> {
+            let space: ::std::sync::Arc<dyn ::ikigai_core::Space> =
+                ::std::sync::Arc::new($space());
+            $crate::run_session(&space, &invoke, __ikigai_module_host_call).await
+        }
+
+        // The host's session pump, a global import: hand it an encoded `ModuleReply`
+        // (a `HostCall`) and it returns the encoded `ModuleCall` (the `HostResult`).
+        #[::wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[::wasm_bindgen::prelude::wasm_bindgen(catch, js_name = "hostCall")]
+            async fn __ikigai_module_host_call_js(
+                reply: &[u8],
+            ) -> ::core::result::Result<::wasm_bindgen::JsValue, ::wasm_bindgen::JsValue>;
+        }
+
+        // Bridge the `!Send` JS call to the `Send` future `run_session` needs: confine the
+        // `JsFuture` to a `spawn_local` task and ferry the bytes back through a oneshot.
+        fn __ikigai_module_host_call(
+            reply: ::std::vec::Vec<u8>,
+        ) -> impl ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<u8>, ::std::string::String>>
+               + ::core::marker::Send {
+            let (tx, rx) = ::futures::channel::oneshot::channel();
+            ::wasm_bindgen_futures::spawn_local(async move {
+                let result = match __ikigai_module_host_call_js(&reply).await {
+                    ::core::result::Result::Ok(value) => {
+                        ::core::result::Result::Ok(::js_sys::Uint8Array::new(&value).to_vec())
+                    }
+                    ::core::result::Result::Err(e) => ::core::result::Result::Err(
+                        ::wasm_bindgen::JsValue::as_string(&e)
+                            .unwrap_or_else(|| ::std::string::String::from("hostCall failed")),
+                    ),
+                };
+                let _ = tx.send(result);
+            });
+            async move {
+                rx.await
+                    .map_err(|_| ::std::string::String::from("hostCall task was dropped"))?
+            }
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1359,67 @@ mod tests {
             }
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    // --- WasmModuleSpace + serve_host_call: the browser's split, exercised on native ----
+
+    // A fake `ModuleSessionTransport` that runs the module side in-process via `run_session`,
+    // servicing each HostCall out-of-band through `serve_host_call` against a separate
+    // host-resources kernel — the same split the browser uses (host drives `invoke_session`;
+    // the module's HostCalls hit a global the host serves), minus the wasm boundary.
+    struct FakeTransport {
+        module: Arc<dyn Space>,
+        host: Arc<Kernel>,
+    }
+
+    #[async_trait]
+    impl ModuleSessionTransport for FakeTransport {
+        async fn invoke_session(&self, invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
+            let host = Arc::clone(&self.host);
+            let host_call = move |reply: Vec<u8>| {
+                let host = Arc::clone(&host);
+                async move {
+                    Ok(serve_host_call(&reply, |request, capability| {
+                        let host = Arc::clone(&host);
+                        async move {
+                            host.issue(request, &capability).await.map_err(|e| e.to_string())
+                        }
+                    })
+                    .await)
+                }
+            };
+            Ok(run_session(&self.module, &invoke, host_call).await)
+        }
+    }
+
+    #[test]
+    fn wasm_module_space_drives_a_session_with_out_of_band_callbacks() {
+        // WasmModuleSpace encodes the Invoke and drives the transport; the module's two
+        // HostCalls are serviced out-of-band by serve_host_call (recording into the sink the
+        // space installed); the result folds that provenance. A correct "hello, module"
+        // proves the whole browser-shaped split composes.
+        let host_resources = Arc::new(Kernel::with_meta_renderer(
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
+                    .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module")),
+            ) as Arc<dyn Space>,
+            Arc::new(PlainRenderer),
+        ));
+        let transport = Arc::new(FakeTransport {
+            module: Arc::new(stub_module()),
+            host: host_resources,
+        });
+        let describe = Description::new("stub-concat").title("Concat (test stub)");
+        let kernel = Kernel::with_meta_renderer(
+            Arc::new(WasmModuleSpace::new(["urn:stub:"], transport, describe)) as Arc<dyn Space>,
+            Arc::new(PlainRenderer),
+        );
+
+        let rep = block_on(kernel.issue(concat_request(), &Capability::root())).expect("wasm invoke");
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
+        // The refs are permanently cacheable (no thread), so the folded result caches too.
+        assert!(kernel.is_cached(&concat_request(), &Capability::root()));
     }
 
     // --- UdsTransport: the same session, but over a real Unix socket -------------------
