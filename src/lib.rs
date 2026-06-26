@@ -50,10 +50,10 @@ use ikigai_core::{
     Bindings, Capability, Description, Endpoint, Error, Expiry, Invocation, Issuer, Representation,
     Request, Resolution, Resolved, Result, Scope, Space, SpaceEntry, Thread,
 };
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -241,8 +241,11 @@ impl ModuleTransport for LoopbackTransport {
 
         // The module side: decode the `Invoke`, run the endpoint under a remote issuer
         // that round-trips each `inv.source` as a `HostCall`/`HostResult`.
-        let module_side =
-            run_module_session(Arc::clone(&self.space), host_to_module_rx, module_to_host_tx);
+        let module_side = run_module_session(
+            Arc::clone(&self.space),
+            host_to_module_rx,
+            module_to_host_tx,
+        );
 
         // The host side: send the `Invoke`, then service each `HostCall` against the host
         // kernel (re-clamping the carried capability to the session — a module may only
@@ -254,10 +257,9 @@ impl ModuleTransport for LoopbackTransport {
             };
             send(&host_to_module_tx, &invoke)?;
             loop {
-                let bytes = module_to_host_rx
-                    .next()
-                    .await
-                    .ok_or_else(|| Error::Endpoint("module closed the session early".to_string()))?;
+                let bytes = module_to_host_rx.next().await.ok_or_else(|| {
+                    Error::Endpoint("module closed the session early".to_string())
+                })?;
                 match decode::<ModuleReply>(&bytes)? {
                     ModuleReply::HostCall {
                         request,
@@ -423,7 +425,9 @@ where
             capability,
         }) => match space.resolve(&request, &Scope::empty()) {
             Resolution::Hit(resolved) => {
-                let issuer = ClosureHostIssuer { host_call: &host_call };
+                let issuer = ClosureHostIssuer {
+                    host_call: &host_call,
+                };
                 let inv =
                     Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
                 match resolved.endpoint.invoke(&inv).await {
@@ -445,7 +449,10 @@ where
     // Encoding a Representation/SpaceEntry shouldn't fail; if it somehow does, still hand
     // back a decodable `ModuleReply::Error` rather than empty bytes.
     encode(&reply).unwrap_or_else(|_| {
-        encode(&ModuleReply::Error("module reply encode failed".to_string())).unwrap_or_default()
+        encode(&ModuleReply::Error(
+            "module reply encode failed".to_string(),
+        ))
+        .unwrap_or_default()
     })
 }
 
@@ -702,8 +709,7 @@ macro_rules! wasm_module {
         /// `hostCall` global while this awaits.
         #[::wasm_bindgen::prelude::wasm_bindgen]
         pub async fn invoke_session(invoke: ::std::vec::Vec<u8>) -> ::std::vec::Vec<u8> {
-            let space: ::std::sync::Arc<dyn ::ikigai_core::Space> =
-                ::std::sync::Arc::new($space());
+            let space: ::std::sync::Arc<dyn ::ikigai_core::Space> = ::std::sync::Arc::new($space());
             $crate::run_session(&space, &invoke, __ikigai_module_host_call).await
         }
 
@@ -721,8 +727,9 @@ macro_rules! wasm_module {
         // `JsFuture` to a `spawn_local` task and ferry the bytes back through a oneshot.
         fn __ikigai_module_host_call(
             reply: ::std::vec::Vec<u8>,
-        ) -> impl ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<u8>, ::std::string::String>>
-               + ::core::marker::Send {
+        ) -> impl ::core::future::Future<
+            Output = ::core::result::Result<::std::vec::Vec<u8>, ::std::string::String>,
+        > + ::core::marker::Send {
             let (tx, rx) = ::futures::channel::oneshot::channel();
             ::wasm_bindgen_futures::spawn_local(async move {
                 let result = match __ikigai_module_host_call_js(&reply).await {
@@ -801,7 +808,8 @@ mod uds {
         }
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
-        postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        postcard::from_bytes(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
     fn io_err(e: io::Error) -> Error {
@@ -847,7 +855,8 @@ mod uds {
                             .issue(request, &clamped)
                             .await
                             .map_err(|e| e.to_string());
-                        write_frame(&mut stream, &ModuleCall::HostResult(result)).map_err(io_err)?;
+                        write_frame(&mut stream, &ModuleCall::HostResult(result))
+                            .map_err(io_err)?;
                     }
                     ModuleReply::Resolved(representation) => return Ok(representation),
                     ModuleReply::Error(message) => return Err(Error::Endpoint(message)),
@@ -1114,17 +1123,20 @@ impl Issuer for HostBridge<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
     use ikigai_core::{
         ArgRef, ArgSpec, Description, EndpointSpace, Exact, Fallback, FnEndpoint, Iri, Kernel,
         MetaRenderer, ReprType, Verb,
     };
-    use futures::executor::block_on;
 
     // A tiny meta renderer so the test kernel can describe endpoints if asked.
     struct PlainRenderer;
     impl MetaRenderer for PlainRenderer {
         fn render(&self, d: &Description, _t: &ReprType) -> Result<Representation> {
-            Ok(Representation::new(ReprType::new("text/plain"), d.id.as_bytes().to_vec()))
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                d.id.as_bytes().to_vec(),
+            ))
         }
     }
 
@@ -1186,8 +1198,14 @@ mod tests {
         // linked into a local space — it's reached only through the ModuleSpace, over the
         // InProcessTransport.
         let host_space = EndpointSpace::new()
-            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
-            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
+            .bind(
+                Exact::new("urn:test:greeting"),
+                fixed("greeting", "text/plain", "hello, "),
+            )
+            .bind(
+                Exact::new("urn:test:subject"),
+                fixed("subject", "text/plain", "module"),
+            );
 
         let module = ModuleSpace::new(
             ["urn:stub:"],
@@ -1215,8 +1233,14 @@ mod tests {
         // The module is a stateless leaf; the HOST kernel caches its result. Same query
         // twice ⇒ the second is served from cache (cache_len stays 1 for the top result).
         let host_space = EndpointSpace::new()
-            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
-            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
+            .bind(
+                Exact::new("urn:test:greeting"),
+                fixed("greeting", "text/plain", "hello, "),
+            )
+            .bind(
+                Exact::new("urn:test:subject"),
+                fixed("subject", "text/plain", "module"),
+            );
         let module = ModuleSpace::new(
             ["urn:stub:"],
             Arc::new(InProcessTransport::new(stub_module())),
@@ -1232,7 +1256,10 @@ mod tests {
                 .with_arg("b", ArgRef::Inline(b"urn:test:subject".to_vec()))
         };
         let a = block_on(kernel.issue(req(), &Capability::root())).unwrap();
-        assert!(kernel.is_cached(&req(), &Capability::root()), "module result is cacheable host-side");
+        assert!(
+            kernel.is_cached(&req(), &Capability::root()),
+            "module result is cacheable host-side"
+        );
         let b = block_on(kernel.issue(req(), &Capability::root())).unwrap();
         assert_eq!(a.bytes, b.bytes);
     }
@@ -1248,9 +1275,18 @@ mod tests {
     // Host space + a module routed over `transport`, as one root space.
     fn root_over(transport: impl ModuleTransport + 'static) -> Arc<dyn Space> {
         let host_space = EndpointSpace::new()
-            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
-            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
-        let module = ModuleSpace::new(["urn:stub:"], Arc::new(transport) as Arc<dyn ModuleTransport>);
+            .bind(
+                Exact::new("urn:test:greeting"),
+                fixed("greeting", "text/plain", "hello, "),
+            )
+            .bind(
+                Exact::new("urn:test:subject"),
+                fixed("subject", "text/plain", "module"),
+            );
+        let module = ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(transport) as Arc<dyn ModuleTransport>,
+        );
         Arc::new(Fallback::new(vec![
             Arc::new(host_space) as Arc<dyn Space>,
             Arc::new(module) as Arc<dyn Space>,
@@ -1262,9 +1298,12 @@ mod tests {
         // Same stub, but every Invoke / HostCall / HostResult / Resolved is postcard-encoded
         // over a byte channel. A correct "hello, module" proves the session state machine ran
         // and that Request, Capability, and Representation all round-tripped through the codec.
-        let kernel =
-            Kernel::with_meta_renderer(root_over(LoopbackTransport::new(stub_module())), Arc::new(PlainRenderer));
-        let rep = block_on(kernel.issue(concat_request(), &Capability::root())).expect("loopback invoke");
+        let kernel = Kernel::with_meta_renderer(
+            root_over(LoopbackTransport::new(stub_module())),
+            Arc::new(PlainRenderer),
+        );
+        let rep =
+            block_on(kernel.issue(concat_request(), &Capability::root())).expect("loopback invoke");
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
     }
 
@@ -1274,8 +1313,10 @@ mod tests {
         // invocation), so the serialized transform inherits their cacheability and is cached
         // host-side — exactly as the in-process transport. Provenance rides the callbacks,
         // not the serialized `Resolved` (whose threads are `serde(skip)`).
-        let kernel =
-            Kernel::with_meta_renderer(root_over(LoopbackTransport::new(stub_module())), Arc::new(PlainRenderer));
+        let kernel = Kernel::with_meta_renderer(
+            root_over(LoopbackTransport::new(stub_module())),
+            Arc::new(PlainRenderer),
+        );
         let a = block_on(kernel.issue(concat_request(), &Capability::root())).unwrap();
         assert!(
             kernel.is_cached(&concat_request(), &Capability::root()),
@@ -1303,8 +1344,11 @@ mod tests {
         let reply: ModuleReply = decode(&block_on(module_to_host_rx.next()).unwrap()).unwrap();
         match reply {
             ModuleReply::Bindings(entries) => {
-                let patterns: Vec<String> =
-                    entries.unwrap_or_default().into_iter().map(|e| e.pattern).collect();
+                let patterns: Vec<String> = entries
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| e.pattern)
+                    .collect();
                 assert!(
                     patterns.iter().any(|p| p == "urn:stub:concat"),
                     "expected urn:stub:concat in bindings, got {patterns:?}"
@@ -1322,8 +1366,14 @@ mod tests {
         // resolves it on a host kernel, and encodes the HostResult. This is the exact shape
         // the browser uses, with a JS byte-channel as the pump.
         let host_space = EndpointSpace::new()
-            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
-            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
+            .bind(
+                Exact::new("urn:test:greeting"),
+                fixed("greeting", "text/plain", "hello, "),
+            )
+            .bind(
+                Exact::new("urn:test:subject"),
+                fixed("subject", "text/plain", "module"),
+            );
         let host_kernel = Arc::new(Kernel::with_meta_renderer(
             Arc::new(host_space) as Arc<dyn Space>,
             Arc::new(PlainRenderer),
@@ -1340,7 +1390,10 @@ mod tests {
             let host_kernel = Arc::clone(&host_kernel);
             async move {
                 match decode::<ModuleReply>(&reply_bytes).map_err(|e| e.to_string())? {
-                    ModuleReply::HostCall { request, capability } => {
+                    ModuleReply::HostCall {
+                        request,
+                        capability,
+                    } => {
                         let result = host_kernel
                             .issue(request, &capability)
                             .await
@@ -1382,7 +1435,9 @@ mod tests {
                     Ok(serve_host_call(&reply, |request, capability| {
                         let host = Arc::clone(&host);
                         async move {
-                            host.issue(request, &capability).await.map_err(|e| e.to_string())
+                            host.issue(request, &capability)
+                                .await
+                                .map_err(|e| e.to_string())
                         }
                     })
                     .await)
@@ -1401,8 +1456,14 @@ mod tests {
         let host_resources = Arc::new(Kernel::with_meta_renderer(
             Arc::new(
                 EndpointSpace::new()
-                    .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
-                    .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module")),
+                    .bind(
+                        Exact::new("urn:test:greeting"),
+                        fixed("greeting", "text/plain", "hello, "),
+                    )
+                    .bind(
+                        Exact::new("urn:test:subject"),
+                        fixed("subject", "text/plain", "module"),
+                    ),
             ) as Arc<dyn Space>,
             Arc::new(PlainRenderer),
         ));
@@ -1416,7 +1477,8 @@ mod tests {
             Arc::new(PlainRenderer),
         );
 
-        let rep = block_on(kernel.issue(concat_request(), &Capability::root())).expect("wasm invoke");
+        let rep =
+            block_on(kernel.issue(concat_request(), &Capability::root())).expect("wasm invoke");
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
         // The refs are permanently cacheable (no thread), so the folded result caches too.
         assert!(kernel.is_cached(&concat_request(), &Capability::root()));
@@ -1430,8 +1492,8 @@ mod tests {
         use std::os::unix::net::UnixListener;
         use std::thread;
 
-        let path = std::env::temp_dir()
-            .join(format!("ikigai-module-uds-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ikigai-module-uds-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // Module server: the stub space, served on one accepted connection on its own thread.
@@ -1445,8 +1507,14 @@ mod tests {
         // Host kernel: urn:stub:* routed to the module over the socket; the two refs it
         // pulls back live only on the host.
         let host_space = EndpointSpace::new()
-            .bind(Exact::new("urn:test:greeting"), fixed("greeting", "text/plain", "hello, "))
-            .bind(Exact::new("urn:test:subject"), fixed("subject", "text/plain", "module"));
+            .bind(
+                Exact::new("urn:test:greeting"),
+                fixed("greeting", "text/plain", "hello, "),
+            )
+            .bind(
+                Exact::new("urn:test:subject"),
+                fixed("subject", "text/plain", "module"),
+            );
         let module = ModuleSpace::new(
             ["urn:stub:"],
             Arc::new(crate::uds::UdsTransport::connect(&path)),
@@ -1460,7 +1528,8 @@ mod tests {
         // A correct result means Invoke + two HostCalls + two HostResults + Resolved all
         // crossed the socket as framed postcard messages, and the module's `inv.source`
         // calls resolved back on the host kernel.
-        let rep = block_on(kernel.issue(concat_request(), &Capability::root())).expect("uds invoke");
+        let rep =
+            block_on(kernel.issue(concat_request(), &Capability::root())).expect("uds invoke");
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
         // Cached host-side via the callbacks' provenance, exactly as the other transports.
         assert!(kernel.is_cached(&concat_request(), &Capability::root()));
@@ -1477,13 +1546,16 @@ mod tests {
         // The peercred guard `serve` applies: a peer connecting from this same process
         // reads back as our own UID, so it's admitted (and a different user would not be).
         use std::os::unix::net::{UnixListener, UnixStream};
-        let path = std::env::temp_dir()
-            .join(format!("ikigai-module-uid-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ikigai-module-uid-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let client = UnixStream::connect(&path).unwrap();
         let (server_side, _) = listener.accept().unwrap();
-        assert_eq!(crate::uds::peer_uid(&server_side), Some(crate::uds::own_uid()));
+        assert_eq!(
+            crate::uds::peer_uid(&server_side),
+            Some(crate::uds::own_uid())
+        );
         drop(client);
         let _ = std::fs::remove_file(&path);
     }
