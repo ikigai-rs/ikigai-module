@@ -604,11 +604,18 @@ pub struct WasmModuleSpace {
     prefixes: Vec<String>,
     transport: Arc<dyn ModuleSessionTransport>,
     describe: Description,
+    /// Concrete endpoint IRIs this module advertises, each with its own card. Populated
+    /// via [`with_endpoint`](Self::with_endpoint). When non-empty these drive `entries()`
+    /// (so the ops list in the catalog) and a per-IRI `Meta` card; when empty the space
+    /// behaves exactly as before (prefix routing only, no enumeration).
+    endpoints: Vec<(String, Description)>,
 }
 
 impl WasmModuleSpace {
     /// Route every IRI starting with one of `prefixes` to `transport`; `describe` is the
-    /// module endpoint's self-description (for `Meta` / the catalog).
+    /// module endpoint's self-description (for `Meta` / the catalog). With no enumerated
+    /// endpoints (see [`with_endpoint`](Self::with_endpoint)) the space does not list in
+    /// the catalog — it only resolves by prefix.
     pub fn new(
         prefixes: impl IntoIterator<Item = impl Into<String>>,
         transport: Arc<dyn ModuleSessionTransport>,
@@ -618,24 +625,66 @@ impl WasmModuleSpace {
             prefixes: prefixes.into_iter().map(Into::into).collect(),
             transport,
             describe,
+            endpoints: Vec::new(),
         }
+    }
+
+    /// Declare a concrete endpoint IRI and its self-description so it **enumerates into the
+    /// catalog** and answers `Meta` with its own card — without loading the module. The
+    /// host supplies these as static data (a tiny manifest); the catalog reads only
+    /// `entries()` + `describe()` (pure metadata), so the wasm artifact is still fetched
+    /// and instantiated lazily, on the first real `Source`/`Sink` against the IRI. Builder
+    /// style; call once per endpoint.
+    pub fn with_endpoint(mut self, iri: impl Into<String>, describe: Description) -> Self {
+        self.endpoints.push((iri.into(), describe));
+        self
+    }
+
+    /// The card to hand the resolved endpoint for `target`: the enumerated endpoint's own
+    /// description if `target` is one, else the generic prefix card.
+    fn card_for(&self, target: &str) -> Description {
+        self.endpoints
+            .iter()
+            .find(|(iri, _)| iri == target)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_else(|| self.describe.clone())
     }
 }
 
 impl Space for WasmModuleSpace {
     fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
         let target = request.target.as_str();
-        if self.prefixes.iter().any(|p| target.starts_with(p.as_str())) {
+        let matches = self.endpoints.iter().any(|(iri, _)| iri == target)
+            || self.prefixes.iter().any(|p| target.starts_with(p.as_str()));
+        if matches {
             Resolution::Hit(Resolved {
                 endpoint: Arc::new(WasmModuleEndpoint {
                     transport: Arc::clone(&self.transport),
-                    describe: self.describe.clone(),
+                    describe: self.card_for(target),
                 }),
                 bindings: Bindings::new(),
             })
         } else {
             Resolution::Miss
         }
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        // Only the explicitly-declared endpoints enumerate; a bare prefix can't list its
+        // (open) IRI set. Empty => `None`, preserving the prior "not in the catalog"
+        // behaviour for modules that declare nothing.
+        if self.endpoints.is_empty() {
+            return None;
+        }
+        Some(
+            self.endpoints
+                .iter()
+                .map(|(iri, describe)| SpaceEntry {
+                    pattern: iri.clone(),
+                    endpoint: describe.id.clone(),
+                })
+                .collect(),
+        )
     }
 }
 
@@ -1482,6 +1531,80 @@ mod tests {
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
         // The refs are permanently cacheable (no thread), so the folded result caches too.
         assert!(kernel.is_cached(&concat_request(), &Capability::root()));
+    }
+
+    #[test]
+    fn declared_endpoints_enumerate_and_meta_without_loading_the_module() {
+        // Enumeration and `Meta` are pure host-side metadata: a `WasmModuleSpace` answers
+        // both from the cards declared via `with_endpoint`, never touching the transport —
+        // so the wasm artifact stays lazy (it loads only on a real `Source`/`Sink`).
+        struct NeverTransport;
+        #[async_trait]
+        impl ModuleSessionTransport for NeverTransport {
+            async fn invoke_session(
+                &self,
+                _invoke: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, String> {
+                panic!("transport invoked for a metadata-only operation — module loaded eagerly");
+            }
+        }
+
+        let space = WasmModuleSpace::new(
+            ["urn:jsonld:"],
+            Arc::new(NeverTransport),
+            Description::new("jsonld"),
+        )
+        .with_endpoint(
+            "urn:jsonld:expand",
+            Description::new("urn:jsonld:expand").title("Expand"),
+        )
+        .with_endpoint(
+            "urn:jsonld:compact",
+            Description::new("urn:jsonld:compact").title("Compact"),
+        );
+
+        // entries() lists exactly the declared IRIs, so the catalog renders their cards.
+        let entries = space.entries().expect("declared endpoints enumerate");
+        let patterns: Vec<&str> = entries.iter().map(|e| e.pattern.as_str()).collect();
+        assert_eq!(patterns, ["urn:jsonld:expand", "urn:jsonld:compact"]);
+
+        // Meta on a declared IRI resolves to that endpoint's own card.
+        let scope = Scope::empty();
+        let expand = Iri::parse("urn:jsonld:expand").unwrap();
+        let Resolution::Hit(resolved) = space.resolve(&Request::new(Verb::Meta, expand), &scope)
+        else {
+            panic!("a declared IRI should resolve");
+        };
+        assert_eq!(resolved.endpoint.describe().title, "Expand");
+
+        // An undeclared IRI under the prefix still resolves, with the generic card.
+        let flatten = Iri::parse("urn:jsonld:flatten").unwrap();
+        let Resolution::Hit(generic) = space.resolve(&Request::new(Verb::Meta, flatten), &scope)
+        else {
+            panic!("a prefix-matched IRI should resolve");
+        };
+        assert_eq!(generic.endpoint.describe().id, "jsonld");
+    }
+
+    #[test]
+    fn a_module_space_with_no_declared_endpoints_does_not_enumerate() {
+        // Backward-compatible: a bare prefix space contributes nothing to the catalog.
+        struct NeverTransport;
+        #[async_trait]
+        impl ModuleSessionTransport for NeverTransport {
+            async fn invoke_session(
+                &self,
+                _invoke: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, String> {
+                unreachable!()
+            }
+        }
+        let space = WasmModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(NeverTransport),
+            Description::new("stub"),
+        );
+        assert!(space.entries().is_none());
     }
 
     // --- UdsTransport: the same session, but over a real Unix socket -------------------
