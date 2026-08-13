@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-module"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -10,7 +10,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-module"
 keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 
 [dependencies]
-ikigai-core = "0.1.21"  # needs the public Invocation::with_issuer (the module seam)
+ikigai-core = "0.1.46" # 0.1.46 = SpaceEntry::new (the federated-catalog `origin` field made the struct literal a break)
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 # The loopback transport runs the ModuleCall/ModuleReply session over in-memory byte

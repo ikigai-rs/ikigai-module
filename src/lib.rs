@@ -676,13 +676,14 @@ impl Space for WasmModuleSpace {
         if self.endpoints.is_empty() {
             return None;
         }
+        // `SpaceEntry::new` leaves `origin: None`, which is the correct semantics here and
+        // not a placeholder: a lazy module's bindings ARE this kernel's own bindings.
+        // `origin` is `Some(label)` only for a binding surfaced from a *mounted remote*
+        // in a federated catalog — a module loaded in-process is not a remote.
         Some(
             self.endpoints
                 .iter()
-                .map(|(iri, describe)| SpaceEntry {
-                    pattern: iri.clone(),
-                    endpoint: describe.id.clone(),
-                })
+                .map(|(iri, describe)| SpaceEntry::new(iri.clone(), describe.id.clone()))
                 .collect(),
         )
     }
