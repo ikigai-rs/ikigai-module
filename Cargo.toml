@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-module"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -10,7 +10,12 @@ homepage = "https://github.com/ikigai-rs/ikigai-module"
 keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 
 [dependencies]
-ikigai-core = "0.1.46" # 0.1.46 = SpaceEntry::new (the federated-catalog `origin` field made the struct literal a break)
+# 0.1.64 = `Resolved.canonical` (the alias/rewrite-reporting field). The pin states the
+# true minimum: both `Space::resolve` impls below build a `Resolved` literal, which does
+# not compile before that field exists. The earlier floor was 0.1.46 = `SpaceEntry::new`
+# (the federated-catalog `origin` field made THAT struct literal a break) — the same event,
+# twice. Both times the break is what surfaced the sites, so the literals stay literals.
+ikigai-core = "0.1.64"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 # The loopback transport runs the ModuleCall/ModuleReply session over in-memory byte

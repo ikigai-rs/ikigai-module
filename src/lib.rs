@@ -663,6 +663,14 @@ impl Space for WasmModuleSpace {
                     describe: self.card_for(target),
                 }),
                 bindings: Bindings::new(),
+                // No rewrite: this space ORIGINATES a resolution. It matches the
+                // request's own target against declared endpoints or a prefix and
+                // routes it to the module unchanged, so there is no other name for
+                // the kernel to canonicalize onto. `None` here is a claim, not a
+                // default — hence the literal rather than `Resolved::new`: the next
+                // field `Resolved` grows breaks this site on purpose, so the claim
+                // gets re-read instead of silently inheriting a default.
+                canonical: None,
             })
         } else {
             Resolution::Miss
@@ -1119,6 +1127,11 @@ impl Space for ModuleSpace {
                     transport: Arc::clone(&self.transport),
                 }),
                 bindings: Bindings::new(),
+                // No rewrite: prefix match routes the request's own target to the
+                // module untouched, so this resolution has no canonical name to
+                // report. See the note on `WasmModuleSpace::resolve` for why this
+                // stays a struct literal — the compile break IS the review trigger.
+                canonical: None,
             })
         } else {
             Resolution::Miss
