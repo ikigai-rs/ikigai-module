@@ -431,9 +431,10 @@ impl ModuleAliases {
     fn route(&self, target: &Iri) -> Routing {
         if let ModuleRewrite::Undeclarable(reason) = &self.rewrite {
             let message = format!(
-                "module rewrites {target} in a way it cannot declare ({reason}), so the host \
-                 cannot give the logical and backing names one identity: they would be two \
-                 cache entries and two golden threads over one resource.",
+                "module may rewrite {target} in a way it cannot declare ({reason}), so the \
+                 host cannot give a logical name and its backing name one identity: they \
+                 would be two cache entries and two golden threads over one resource. \
+                 Which targets are affected is exactly what the module could not say.",
                 target = target.as_str(),
             );
             return match &self.policy {
@@ -447,9 +448,9 @@ impl ModuleAliases {
                 }
             };
         }
-        // `Unknown` and `None` alike install no table: one because there is nothing to
-        // apply, the other because there is nothing known to apply. They differ in what
-        // the module side does — see `refuse_undeclared_rewrite`.
+        // `None` and `Unknown` alike install no table — nothing to apply, and nothing
+        // known to apply, respectively. Both resolve under the name as given; where they
+        // differ is what the module side does, see `refuse_undeclared_rewrite`.
         let Some(table) = &self.table else {
             return Routing::Direct;
         };
