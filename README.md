@@ -24,6 +24,10 @@ module's result is cached and invalidated exactly as a statically-linked space w
 | `InProcessTransport` | host | Phase-1 transport: runs the module in-process and hands the host straight to the module's `Invocation`, exercising the full callback path with zero wire risk. |
 | `HostBridge` | host | The host end of the callback channel — an `Issuer` that forwards a module's sub-request back through the originating `Invocation`, recording its golden thread. |
 | `ModuleCall` / `ModuleReply` | wire | The Phase-2 session protocol (`Invoke` / `HostCall` / `HostResult` / `Resolved` / …). Pinned now even though the in-process transport calls directly. |
+| `LoopbackTransport` | host | The same session run **through the codec** — every message postcard-encoded over an in-memory byte channel, both ends in-process. Proves the protocol without a socket. |
+| `UdsTransport` / `serve` | both | The first real home: the module runs out-of-process behind a peercred-guarded Unix socket, driven over framed socket I/O. |
+| `WasmModuleSpace` / `wasm_module!` | both | The lazy browser module: one macro line emits the artifact's glue, one `WasmModuleSpace` binds it host-side. |
+| `ModuleRewrite` / `ModuleManifest` | wire | How the module **names** things — what lets it compose a rewriting space (see below). |
 
 ## Why a session, not a round-trip
 
@@ -56,6 +60,62 @@ The module's endpoints can now resolve `urn:xslt:` IRIs, and any `inv.source(..)
 make crosses back through the host kernel — so a module endpoint that joins two
 host-resolved resources inherits both of their golden threads, and the host caches the
 combined result. (See the crate's tests for that end-to-end.)
+
+## Composing a rewriting space in a module
+
+Any space should be composable in any module, including one that resolves one name under
+another — an `Alias` (a table), a `Rewrite` (a closure), anything reporting
+`Resolved::canonical`. That report is what makes a logical name and its backing name **one
+resource**: one cache entry, one golden thread, one capability floor.
+
+It cannot ride the resolution across the boundary. The host never asks the module to
+resolve — `ModuleSpace::resolve` is a prefix match and `ModuleCall::Invoke` is the first
+message, by which time the cache key already exists — and a resolve round trip cannot
+simply be added, because `Space::resolve` is *synchronous* while a real transport is not.
+
+So the module **declares** how it names things, and the host applies it locally:
+
+```rust
+use std::sync::Arc;
+use ikigai_core::{Alias, AliasTable, Space};
+use ikigai_module::{InProcessTransport, ModuleRewrite, ModuleSpace};
+
+// One table, used twice: the module rewrites through it, and declares it.
+let table = Arc::new(AliasTable::new().prefix("urn:xslt:v1:", "urn:xslt:"));
+let space: Arc<dyn Space> = Arc::new(Alias::new(Arc::clone(&table), Arc::new(ikigai_xslt::space())));
+let transport = Arc::new(
+    InProcessTransport::from_arc(space).declaring(ModuleRewrite::from_table(&table)),
+);
+
+// `connect` asks once, at mount time, and installs the declaration in the host's own table.
+let module = ModuleSpace::connect(["urn:xslt:"], transport).await?;
+```
+
+From there the rewrite is applied **host-side, synchronously, inside `Space::resolve`** by
+the kernel's own `AliasTable`, and reported on `Resolved::canonical` — so the kernel adopts
+the backing name before it computes the request id. `urn:xslt:v1:transform` and
+`urn:xslt:transform` are then one cache entry and one golden thread. This is `Meta`
+("describe yourself") reaching one layer further, not a new mechanism.
+
+### What cannot be declared is said out loud
+
+A table can be written down; an arbitrary hand-written rewriting space cannot. That is a
+property of crossing a process boundary — the far side can share identity only as far as it
+can describe itself. Three things keep the residual visible instead of silent:
+
+- **`ModuleRewrite::Unknown` is never read as "does not rewrite."** It is the absence of a
+  claim (a module that was not asked, or a peer older than `ModuleCall::Manifest`).
+- **`ModuleRewrite::Undeclarable(reason)`** is a module saying it rewrites in a way it
+  cannot express. The host then **refuses** (the default) or accepts it with a warning —
+  `ModuleSpace::on_undeclarable(OnUndeclarable::Warn(sink))`. Never neither.
+- **The module side refuses an invocation whose resolution reports a canonical the host did
+  not already apply.** A rewrite nobody declared fails loudly, naming both names, at the one
+  moment it is knowable — instead of returning a right-looking answer filed under the wrong
+  name.
+
+A declared table is also validated at mount time: it must parse, and every rule must stay
+inside the prefixes the host routed to the module. A module may only canonicalize names it
+was given.
 
 ## Phasing
 

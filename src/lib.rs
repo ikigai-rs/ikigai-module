@@ -36,6 +36,22 @@
 //!   the host registers it with one `WasmModuleSpace::new` + a `serve_host_call` in its
 //!   `hostCall` export — no hand-written wrapper crate or per-module endpoint.
 //!
+//! ## A module may compose a rewriting space
+//!
+//! Any space should be composable in any module — including one that resolves one name
+//! under another ([`Alias`](ikigai_core::Alias), [`Rewrite`](ikigai_core::Rewrite), anything
+//! reporting `Resolved::canonical`). That report is what makes a logical name and its
+//! backing name ONE resource, and it cannot ride the resolution across the boundary: the
+//! host never asks the module to resolve, and `Space::resolve` is synchronous while a real
+//! transport is not.
+//!
+//! So the module **declares** its canonicalization ([`ModuleRewrite`], carried on
+//! [`ModuleCall::Manifest`]) and the host installs it in its own `AliasTable`
+//! ([`ModuleSpace::connect`]) — self-description reaching one layer further, applied
+//! host-side at resolve time by machinery the kernel already ships. What cannot be
+//! declared is said out loud rather than silently split: see [`ModuleRewrite::Undeclarable`]
+//! and [`OnUndeclarable`].
+//!
 //! See `ikigai-cli/docs/module-format-design.md`.
 
 // `deny`, not `forbid`, so the UDS server's peercred check (and only it) can opt into the
@@ -47,13 +63,15 @@ use futures::channel::mpsc;
 use futures::lock::Mutex as AsyncMutex;
 use futures::StreamExt;
 use ikigai_core::{
-    Bindings, Capability, Description, Endpoint, Error, Expiry, Invocation, Issuer, Representation,
-    Request, Resolution, Resolved, Result, Scope, Space, SpaceEntry, Thread,
+    AliasParseError, AliasTable, Bindings, Canonical, Capability, Description, Endpoint, Error,
+    Expiry, FnEndpoint, Invocation, Iri, Issuer, Representation, Request, Resolution, Resolved,
+    Result, Scope, Space, SpaceEntry, Thread,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -78,6 +96,16 @@ pub enum ModuleCall {
     HostResult(std::result::Result<Representation, String>),
     /// Ask for the module's bound entries (for `entries()` / the catalog).
     Describe,
+    /// Ask for the module's full [`ModuleManifest`] — its bindings **and how it
+    /// rewrites names**. `Describe` one layer further, and the message a host sends
+    /// once, at mount time, so it can install the module's canonicalization in its own
+    /// table before the first resolution. See [`ModuleRewrite`].
+    ///
+    /// Appended after `Describe` on purpose: postcard keys an enum on its variant
+    /// index, so every 0.1.9 message keeps its bytes. A 0.1.9 module receiving this
+    /// fails to decode the call and answers [`ModuleReply::Error`], which a host reads
+    /// as "cannot say" — [`ModuleRewrite::Unknown`], never "does not rewrite".
+    Manifest,
 }
 
 /// module → host.
@@ -95,6 +123,347 @@ pub enum ModuleReply {
     Error(String),
     /// The answer to a [`ModuleCall::Describe`].
     Bindings(Option<Vec<SpaceEntry>>),
+    /// The answer to a [`ModuleCall::Manifest`]. Appended last, for the same
+    /// index-stability reason `Manifest` was.
+    Manifest(ModuleManifest),
+}
+
+// ---------------------------------------------------------------------------
+// ★ The module's self-description of its own NAMING — the part `Describe` was missing.
+//
+// A module may compose any space, and some spaces RESOLVE ONE NAME UNDER ANOTHER: an
+// `Alias` (a table), a `Rewrite` (a closure), anything that reports
+// `Resolved::canonical`. That report is what makes a logical name and its backing name
+// ONE resource in a kernel — one cache entry, one golden thread, one capability floor.
+//
+// It cannot cross the module boundary by riding on the resolution, because the host
+// never asks the module to resolve: `ModuleSpace::resolve` is a prefix match, and by the
+// time `ModuleCall::Invoke` is sent the host has already keyed its cache. Nor can a
+// resolve round trip simply be added — `Space::resolve` is SYNCHRONOUS and a Phase-2
+// transport (a second wasm instance, a socket) is not.
+//
+// So the module DECLARES its canonicalization and the host applies it locally: `Meta`
+// ("describe yourself") reaching one layer further, answered once at mount time, and
+// evaluated at resolve time by `AliasTable`, which the kernel already ships and tests.
+//
+// The residual is honest and NAMED rather than silent: what can be declared is what can
+// be written down — an exact or prefix table. An arbitrary hand-written rewriting space
+// cannot be, and a module that rewrites that way must say `Undeclarable` so the host can
+// refuse or accept it deliberately. Two things stop the undeclared case from becoming the
+// next quiet bug: a `ModuleRewrite::Unknown` is never read as "does not rewrite", and the
+// module side REFUSES an invocation whose resolution reports a canonical the host did not
+// already apply (`refuse_undeclared_rewrite`) — a split identity fails loudly at the one
+// moment it is knowable, instead of returning a right-looking answer filed under the
+// wrong name.
+// ---------------------------------------------------------------------------
+
+/// How a module rewrites the names it is given: the module's own answer to "does anything
+/// under my prefix resolve under a *different* name?"
+///
+/// A host installs what this declares in its own [`AliasTable`], so the rewrite is applied
+/// **host-side, synchronously, at resolve time** and reported on
+/// [`Resolved::canonical`](ikigai_core::Resolved::canonical) — after which the kernel's
+/// cache key, golden-thread cut and capability floor all name the backing resource, exactly
+/// as they would for a rewriting space composed locally.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModuleRewrite {
+    /// Every target resolves under the name it was given. The overwhelmingly common
+    /// case, and a positive claim: the host installs nothing and the module-side guard
+    /// stays armed.
+    None,
+    /// Rewritten through this table, in [`AliasTable`]'s line-oriented text form
+    /// (`prefix urn:a: urn:b:` / `exact urn:x urn:y`). Build it from the very table the
+    /// module's `Alias` uses, with [`ModuleRewrite::from_table`], so the declaration and
+    /// the behaviour cannot drift.
+    Table(String),
+    /// The module rewrites in a way it **cannot** write down — a `Rewrite` over an
+    /// arbitrary closure, or any hand-rolled rewriting space. The string is the reason,
+    /// for the operator.
+    ///
+    /// This is the honest residual of crossing a process boundary: the far side can only
+    /// share identity to the extent it can describe itself. Declaring it is what makes
+    /// the residual *visible* — the host then refuses (the default) or accepts it with a
+    /// warning, rather than splitting identity without anyone noticing.
+    Undeclarable(String),
+    /// No claim was made: the module was never asked, or is older than
+    /// [`ModuleCall::Manifest`] and could not answer.
+    ///
+    /// ★ **Not the same as [`None`](ModuleRewrite::None).** `None` is a module saying it
+    /// does not rewrite; this is the absence of a statement. A host must not read it as
+    /// permission to key identity under the name it was given — it is exactly the state
+    /// 0.1.9 was always in, and the module-side guard is what covers it.
+    Unknown,
+}
+
+impl ModuleRewrite {
+    /// Declare `table` — the very table the module's own
+    /// [`Alias`](ikigai_core::Alias) rewrites through.
+    ///
+    /// ```
+    /// use ikigai_core::AliasTable;
+    /// use ikigai_module::ModuleRewrite;
+    ///
+    /// let table = AliasTable::new().exact("urn:xslt:render", "urn:xslt:transform");
+    /// assert_eq!(
+    ///     ModuleRewrite::from_table(&table),
+    ///     ModuleRewrite::Table("exact urn:xslt:render urn:xslt:transform\n".to_string()),
+    /// );
+    /// ```
+    pub fn from_table(table: &AliasTable) -> Self {
+        ModuleRewrite::Table(table.to_text())
+    }
+
+    /// The declared table, parsed. `Ok(None)` for every variant that declares no table —
+    /// including [`Undeclarable`](ModuleRewrite::Undeclarable) and
+    /// [`Unknown`](ModuleRewrite::Unknown), which are handled by policy, not by rewriting.
+    pub fn table(&self) -> std::result::Result<Option<AliasTable>, AliasParseError> {
+        match self {
+            ModuleRewrite::Table(text) => AliasTable::parse(text).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the module actually stated how it names things — `None` or `Table`. A
+    /// declaration is what lets the host share identity across the boundary; the other two
+    /// variants are the cases where it provably cannot.
+    pub fn is_declared(&self) -> bool {
+        matches!(self, ModuleRewrite::None | ModuleRewrite::Table(_))
+    }
+}
+
+/// A module's self-description: its bindings, and how it rewrites names.
+///
+/// One message rather than two because a host asks both questions at the same moment (it
+/// is mounting the module) and a real transport charges a round trip for each.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleManifest {
+    /// The module's bound entries — the same answer [`ModuleCall::Describe`] gives.
+    pub entries: Option<Vec<SpaceEntry>>,
+    /// How the module rewrites names. See [`ModuleRewrite`].
+    pub rewrite: ModuleRewrite,
+}
+
+impl ModuleManifest {
+    /// A manifest declaring `rewrite`.
+    pub fn new(entries: Option<Vec<SpaceEntry>>, rewrite: ModuleRewrite) -> Self {
+        ModuleManifest { entries, rewrite }
+    }
+
+    /// What a host records for a module that could not be asked — a peer older than
+    /// [`ModuleCall::Manifest`], or a transport that cannot carry it. The bindings may
+    /// still be known (`Describe` is 0.1.9 vocabulary); the naming is not.
+    pub fn unknown(entries: Option<Vec<SpaceEntry>>) -> Self {
+        ModuleManifest {
+            entries,
+            rewrite: ModuleRewrite::Unknown,
+        }
+    }
+}
+
+/// What a host does about a module that declares
+/// [`ModuleRewrite::Undeclarable`] — a rewrite whose identity provably cannot be shared
+/// across the boundary.
+///
+/// The signal has to be a *choice*, because both answers are legitimate: a host that
+/// caches and invalidates around this module wants the refusal, and a host that only ever
+/// reads through it once may not care. What is never legitimate is neither — which is
+/// what 0.1.9 did.
+#[derive(Default)]
+pub enum OnUndeclarable {
+    /// Refuse: every target under the module's prefixes resolves to an endpoint that
+    /// fails on invoke, naming the module's reason. The default, because a split identity
+    /// is a wrong answer wearing a right answer's face — a `Sink` through one name leaves
+    /// the other serving stale bytes, and both look plausible.
+    #[default]
+    Refuse,
+    /// Resolve anyway, handing the host's sink a one-line description of what it is
+    /// accepting — once per resolution routed to this module, because which targets are
+    /// affected is exactly what "undeclarable" means the host cannot know. Identity
+    /// splits: this is 0.1.9's behaviour, still reachable, never implicit.
+    Warn(Arc<dyn Fn(&str) + Send + Sync>),
+}
+
+impl fmt::Debug for OnUndeclarable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OnUndeclarable::Refuse => f.write_str("Refuse"),
+            OnUndeclarable::Warn(_) => f.write_str("Warn(..)"),
+        }
+    }
+}
+
+/// ★ The module side's identity guard: refuse an invocation whose resolution **reports a
+/// rewrite the host did not already apply**, and say exactly what went wrong.
+///
+/// A module reaching this point has resolved under a name the host has never seen. The
+/// host has already keyed its representation cache, fired its golden-thread cut and
+/// evaluated the declared-capability floor under the name it *was* given, so serving the
+/// answer files it under the wrong name — the identity split `Resolved::canonical` exists
+/// to close, reintroduced at the boundary. That is not repairable after the fact (the
+/// cache key exists before the first byte crosses), so it is refused.
+///
+/// Returns the refusal message, or `None` when there is nothing to refuse:
+///
+/// - the resolution reported no rewrite, or reported the name the host already used
+///   (the host applied the declaration; the module's own `Alias` re-canonicalizing an
+///   already-canonical target is a no-op) — the overwhelmingly common path;
+/// - the module declared [`ModuleRewrite::Undeclarable`], which means the host was told
+///   and made its choice through [`OnUndeclarable`]. Not the guard's call to overturn.
+fn refuse_undeclared_rewrite(
+    request: &Request,
+    resolved: &Resolved,
+    declared: &ModuleRewrite,
+) -> Option<String> {
+    if matches!(declared, ModuleRewrite::Undeclarable(_)) {
+        return None;
+    }
+    let canonical = resolved.canonical.as_ref()?;
+    if canonical == &request.target {
+        return None;
+    }
+    Some(format!(
+        "module resolved {logical} under {canonical}, a rewrite it never declared: the host \
+         has already keyed its cache, cut its golden thread and checked the capability floor \
+         under {logical}, so the two names would be two resources. Declare the rewrite \
+         (`ModuleRewrite::from_table`) so the host can apply it before it resolves, or — if \
+         it cannot be written as a table — declare `ModuleRewrite::Undeclarable` so the host \
+         refuses or accepts it deliberately.",
+        logical = request.target.as_str(),
+        canonical = canonical.as_str(),
+    ))
+}
+
+/// The endpoint a refused resolution resolves to: it fails on invoke with `message`. A
+/// `Space` cannot return an error and a refusal must not read as a miss ("nothing is bound
+/// there" is a different, misleading fact), so the refusal becomes an endpoint — the idiom
+/// `Alias` and `RateLimit` already use.
+fn refusing_endpoint(message: String) -> Arc<dyn Endpoint> {
+    Arc::new(FnEndpoint::new("module-refused", move |_inv| {
+        Err(Error::Endpoint(message.clone()))
+    }))
+}
+
+/// What routing a target through a module's declared canonicalization decided.
+enum Routing {
+    /// Resolve under the name as given.
+    Direct,
+    /// Resolve under this name instead, and report it to the kernel.
+    Canonical(Iri),
+    /// Do not resolve: hand back an endpoint that fails with this message.
+    Refuse(String),
+}
+
+/// The host's local copy of a module's declared canonicalization — the whole point of the
+/// declaration, held on the host side of the boundary where `Space::resolve` can consult it
+/// **synchronously**, which is the constraint that rules out asking the module per-request.
+struct ModuleAliases {
+    /// What the module said (or the absence of a statement).
+    rewrite: ModuleRewrite,
+    /// The parsed table, when one was declared. Parsed once, at mount time: a malformed
+    /// table fails when it is read, not on the one request that hits the bad rule.
+    table: Option<AliasTable>,
+    /// What to do about [`ModuleRewrite::Undeclarable`].
+    policy: OnUndeclarable,
+}
+
+impl ModuleAliases {
+    /// Nothing declared — the state a host is in when it never asked. Resolves every
+    /// target under the name it was given, which is 0.1.9's behaviour exactly.
+    fn unknown() -> Self {
+        ModuleAliases {
+            rewrite: ModuleRewrite::Unknown,
+            table: None,
+            policy: OnUndeclarable::default(),
+        }
+    }
+
+    /// Validate `rewrite` against the prefixes the module is mounted at and install it.
+    ///
+    /// ★ **A module may only canonicalize inside its own mounted namespace.** The rewrite
+    /// the host installs decides the kernel's *identity* for the request — its cache key,
+    /// its golden thread, the scope its capability floor is evaluated against. A rule
+    /// pointing outside the prefixes the host routed to this module is a claim on a name
+    /// the module was never given: it would collide the module's cache entry with another
+    /// space's resource under a name that space owns. So it is refused at mount time,
+    /// where an operator is watching, rather than becoming a resolution-time surprise.
+    /// (`urn:kernel:` is called out separately only so the message says why; the kernel
+    /// namespace is unaliasable in core for the same shadowing reason.)
+    fn install(prefixes: &[String], rewrite: ModuleRewrite) -> Result<Self> {
+        let table = rewrite.table().map_err(|e| {
+            Error::Endpoint(format!("module declared an unparseable rewrite table: {e}"))
+        })?;
+        if let Some(table) = &table {
+            for rule in table.rules() {
+                for (side, value) in [("from", rule.from()), ("to", rule.to())] {
+                    if value.starts_with("urn:kernel:") {
+                        return Err(Error::Endpoint(format!(
+                            "module rewrite rule `{} {} {}` names the reserved kernel \
+                             namespace on the {side} side; `urn:kernel:*` is resolved by the \
+                             kernel ahead of any space and cannot be aliased",
+                            rule.kind().keyword(),
+                            rule.from(),
+                            rule.to(),
+                        )));
+                    }
+                    if !prefixes.iter().any(|p| value.starts_with(p.as_str())) {
+                        return Err(Error::Endpoint(format!(
+                            "module rewrite rule `{} {} {}` has a {side} outside the prefixes \
+                             this module is mounted at ({}); a module may only canonicalize \
+                             names the host routed to it",
+                            rule.kind().keyword(),
+                            rule.from(),
+                            rule.to(),
+                            prefixes.join(", "),
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(ModuleAliases {
+            rewrite,
+            table,
+            policy: OnUndeclarable::default(),
+        })
+    }
+
+    /// Route one target: rewrite it if the module declared how, refuse it if the module
+    /// declared that it cannot say, pass it through otherwise.
+    fn route(&self, target: &Iri) -> Routing {
+        if let ModuleRewrite::Undeclarable(reason) = &self.rewrite {
+            let message = format!(
+                "module may rewrite {target} in a way it cannot declare ({reason}), so the \
+                 host cannot give a logical name and its backing name one identity: they \
+                 would be two cache entries and two golden threads over one resource. \
+                 Which targets are affected is exactly what the module could not say.",
+                target = target.as_str(),
+            );
+            return match &self.policy {
+                OnUndeclarable::Refuse => Routing::Refuse(format!(
+                    "{message} Refused. Express the rewrite as an alias table and declare it, \
+                     or set `OnUndeclarable::Warn` to accept the split deliberately."
+                )),
+                OnUndeclarable::Warn(sink) => {
+                    sink(&format!("{message} Accepted (OnUndeclarable::Warn)."));
+                    Routing::Direct
+                }
+            };
+        }
+        // `None` and `Unknown` alike install no table — nothing to apply, and nothing
+        // known to apply, respectively. Both resolve under the name as given; where they
+        // differ is what the module side does, see `refuse_undeclared_rewrite`.
+        let Some(table) = &self.table else {
+            return Routing::Direct;
+        };
+        match table.canonicalize(target) {
+            Canonical::Direct => Routing::Direct,
+            Canonical::Aliased(hop) => Routing::Canonical(hop.canonical().clone()),
+            // A cycle or an over-long chain: refused, never half-applied. Core's decision
+            // 5, on the host's side of the boundary.
+            Canonical::Refused(refusal) => {
+                Routing::Refuse(format!("module alias rewrite refused: {refusal}"))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +493,21 @@ pub trait ModuleTransport: Send + Sync {
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         None
     }
+
+    /// Ask the module for its [`ModuleManifest`] — bindings **and** how it rewrites names.
+    ///
+    /// Asked **once, at mount time** ([`ModuleSpace::connect`]), never per resolution:
+    /// `Space::resolve` is synchronous and a real transport is not, which is precisely why
+    /// the module declares its canonicalization instead of being asked to resolve.
+    ///
+    /// The default answers [`ModuleManifest::unknown`] — the honest answer for a transport
+    /// that cannot carry the question, and for a peer older than
+    /// [`ModuleCall::Manifest`]. It is a *defaulted* method so a third-party transport keeps
+    /// compiling; the cost is that such a transport reports `Unknown`, which is exactly
+    /// what it is.
+    async fn manifest(&self) -> Result<ModuleManifest> {
+        Ok(ModuleManifest::unknown(self.entries()))
+    }
 }
 
 /// **Phase 1.** The module runs in the same process; "transport" is a direct call. The
@@ -133,6 +517,7 @@ pub trait ModuleTransport: Send + Sync {
 /// without touching the module's code or [`ModuleSpace`].
 pub struct InProcessTransport {
     space: Arc<dyn Space>,
+    rewrite: ModuleRewrite,
 }
 
 impl InProcessTransport {
@@ -140,12 +525,38 @@ impl InProcessTransport {
     pub fn new(space: impl Space + 'static) -> Self {
         Self {
             space: Arc::new(space),
+            rewrite: ModuleRewrite::Unknown,
         }
     }
 
     /// Wrap an already-`Arc`'d space.
     pub fn from_arc(space: Arc<dyn Space>) -> Self {
-        Self { space }
+        Self {
+            space,
+            rewrite: ModuleRewrite::Unknown,
+        }
+    }
+
+    /// Declare how the module's space rewrites names (builder). See [`ModuleRewrite`].
+    ///
+    /// Build the declaration from the *same* [`AliasTable`] the module's
+    /// [`Alias`](ikigai_core::Alias) rewrites through, so the two cannot drift:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use ikigai_core::{Alias, AliasTable, EndpointSpace, Space};
+    /// use ikigai_module::{InProcessTransport, ModuleRewrite};
+    ///
+    /// let table = Arc::new(AliasTable::new().exact("urn:demo:old", "urn:demo:new"));
+    /// let inner: Arc<dyn Space> = Arc::new(EndpointSpace::new());
+    /// let aliased = Arc::new(Alias::new(Arc::clone(&table), inner));
+    /// let transport = InProcessTransport::from_arc(aliased)
+    ///     .declaring(ModuleRewrite::from_table(&table));
+    /// # let _ = transport;
+    /// ```
+    pub fn declaring(mut self, rewrite: ModuleRewrite) -> Self {
+        self.rewrite = rewrite;
+        self
     }
 }
 
@@ -159,6 +570,12 @@ impl ModuleTransport for InProcessTransport {
     ) -> Result<Representation> {
         match self.space.resolve(&request, &Scope::empty()) {
             Resolution::Hit(resolved) => {
+                // The identity guard: a rewrite the host was never told about would file
+                // this answer under the wrong name. Refuse rather than serve it.
+                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, &self.rewrite)
+                {
+                    return Err(Error::Endpoint(message));
+                }
                 // Run the module's endpoint with the HOST as its issuer: its
                 // `inv.source(..)` calls cross back to the host kernel.
                 let inv = Invocation::with_issuer(&request, &resolved.bindings, capability, host);
@@ -170,6 +587,14 @@ impl ModuleTransport for InProcessTransport {
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         self.space.entries()
+    }
+
+    async fn manifest(&self) -> Result<ModuleManifest> {
+        // In-process: no wire, so the declaration is handed over directly.
+        Ok(ModuleManifest::new(
+            self.space.entries(),
+            self.rewrite.clone(),
+        ))
     }
 }
 
@@ -209,6 +634,7 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 /// module invocation are an open question (see the design doc).
 pub struct LoopbackTransport {
     space: Arc<dyn Space>,
+    rewrite: ModuleRewrite,
 }
 
 impl LoopbackTransport {
@@ -216,12 +642,26 @@ impl LoopbackTransport {
     pub fn new(space: impl Space + 'static) -> Self {
         Self {
             space: Arc::new(space),
+            rewrite: ModuleRewrite::Unknown,
         }
     }
 
     /// Wrap an already-`Arc`'d space.
     pub fn from_arc(space: Arc<dyn Space>) -> Self {
-        Self { space }
+        Self {
+            space,
+            rewrite: ModuleRewrite::Unknown,
+        }
+    }
+
+    /// Declare how the module's space rewrites names (builder) — see
+    /// [`InProcessTransport::declaring`]. Unlike the in-process transport, this
+    /// declaration is answered **through the codec**: [`manifest`](Self::manifest) runs a
+    /// real `Manifest`/`Manifest` exchange over the byte channel, which is what proves a
+    /// socket or wasm transport can carry it.
+    pub fn declaring(mut self, rewrite: ModuleRewrite) -> Self {
+        self.rewrite = rewrite;
+        self
     }
 }
 
@@ -243,6 +683,7 @@ impl ModuleTransport for LoopbackTransport {
         // that round-trips each `inv.source` as a `HostCall`/`HostResult`.
         let module_side = run_module_session(
             Arc::clone(&self.space),
+            self.rewrite.clone(),
             host_to_module_rx,
             module_to_host_tx,
         );
@@ -274,9 +715,9 @@ impl ModuleTransport for LoopbackTransport {
                     }
                     ModuleReply::Resolved(representation) => return Ok(representation),
                     ModuleReply::Error(message) => return Err(Error::Endpoint(message)),
-                    ModuleReply::Bindings(_) => {
+                    ModuleReply::Bindings(_) | ModuleReply::Manifest(_) => {
                         return Err(Error::Endpoint(
-                            "module sent Bindings in reply to Invoke".to_string(),
+                            "module answered Invoke with a description".to_string(),
                         ))
                     }
                 }
@@ -296,6 +737,40 @@ impl ModuleTransport for LoopbackTransport {
         // wasm/socket module answers introspection over the wire; see the tests.)
         self.space.entries()
     }
+
+    async fn manifest(&self) -> Result<ModuleManifest> {
+        // ★ Through the codec, deliberately. The declaration is only worth anything if it
+        // survives serialization — a Phase-2 transport carries it as bytes — so this runs
+        // the real `ModuleCall::Manifest` / `ModuleReply::Manifest` exchange over the byte
+        // channel rather than reading `self.rewrite` directly, the way `entries()` may.
+        let (host_to_module_tx, host_to_module_rx) = mpsc::unbounded::<Vec<u8>>();
+        let (module_to_host_tx, mut module_to_host_rx) = mpsc::unbounded::<Vec<u8>>();
+        let module_side = run_module_session(
+            Arc::clone(&self.space),
+            self.rewrite.clone(),
+            host_to_module_rx,
+            module_to_host_tx,
+        );
+        let host_side = async {
+            send(&host_to_module_tx, &ModuleCall::Manifest)?;
+            let bytes = module_to_host_rx
+                .next()
+                .await
+                .ok_or_else(|| Error::Endpoint("module closed the session early".to_string()))?;
+            match decode::<ModuleReply>(&bytes)? {
+                ModuleReply::Manifest(manifest) => Ok(manifest),
+                // A peer that predates `Manifest` fails to decode the call and answers
+                // `Error`; its bindings are still askable the 0.1.9 way, but its naming is
+                // `Unknown` — never "does not rewrite".
+                ModuleReply::Error(_) => Ok(ModuleManifest::unknown(self.space.entries())),
+                _ => Err(Error::Endpoint(
+                    "module answered Manifest with something else".to_string(),
+                )),
+            }
+        };
+        let (_module_done, result) = futures::join!(module_side, host_side);
+        result
+    }
 }
 
 /// Send a `postcard`-encoded message down a byte channel.
@@ -310,6 +785,7 @@ fn send<T: Serialize>(tx: &mpsc::UnboundedSender<Vec<u8>>, message: &T) -> Resul
 /// `inv.source`/`inv.issue` cross the (serialized) channel back to the host kernel.
 async fn run_module_session(
     space: Arc<dyn Space>,
+    rewrite: ModuleRewrite,
     mut from_host: mpsc::UnboundedReceiver<Vec<u8>>,
     to_host: mpsc::UnboundedSender<Vec<u8>>,
 ) {
@@ -322,17 +798,21 @@ async fn run_module_session(
             capability,
         }) => match space.resolve(&request, &Scope::empty()) {
             Resolution::Hit(resolved) => {
-                // The issuer now owns the receiver: after `Invoke`, every inbound message
-                // is a `HostResult` answering one of its `HostCall`s.
-                let issuer = SessionHostIssuer {
-                    to_host: to_host.clone(),
-                    from_host: AsyncMutex::new(from_host),
-                };
-                let inv =
-                    Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
-                match resolved.endpoint.invoke(&inv).await {
-                    Ok(representation) => ModuleReply::Resolved(representation),
-                    Err(e) => ModuleReply::Error(e.to_string()),
+                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, &rewrite) {
+                    ModuleReply::Error(message)
+                } else {
+                    // The issuer now owns the receiver: after `Invoke`, every inbound
+                    // message is a `HostResult` answering one of its `HostCall`s.
+                    let issuer = SessionHostIssuer {
+                        to_host: to_host.clone(),
+                        from_host: AsyncMutex::new(from_host),
+                    };
+                    let inv =
+                        Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
+                    match resolved.endpoint.invoke(&inv).await {
+                        Ok(representation) => ModuleReply::Resolved(representation),
+                        Err(e) => ModuleReply::Error(e.to_string()),
+                    }
                 }
             }
             Resolution::Miss => ModuleReply::Error(format!(
@@ -341,6 +821,9 @@ async fn run_module_session(
             )),
         },
         Ok(ModuleCall::Describe) => ModuleReply::Bindings(space.entries()),
+        Ok(ModuleCall::Manifest) => {
+            ModuleReply::Manifest(ModuleManifest::new(space.entries(), rewrite))
+        }
         Ok(ModuleCall::HostResult(_)) => {
             ModuleReply::Error("module received HostResult before Invoke".to_string())
         }
@@ -419,20 +902,45 @@ where
     F: Fn(Vec<u8>) -> Fut + Send + Sync,
     Fut: core::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send,
 {
+    run_session_declaring(space, &ModuleRewrite::Unknown, invoke, host_call).await
+}
+
+/// [`run_session`], for a module that **rewrites names** and can say how.
+///
+/// A wasm module reached through [`wasm_module!`] declares nothing, so `run_session`
+/// answers [`ModuleRewrite::Unknown`] — the truthful answer, and the one that keeps the
+/// identity guard armed. A module that composes an [`Alias`](ikigai_core::Alias) passes its
+/// declaration here instead, and a host that has the matching declaration (statically, via
+/// [`WasmModuleSpace::declaring`], or over the wire via [`ModuleCall::Manifest`]) shares one
+/// identity with it across the boundary.
+pub async fn run_session_declaring<F, Fut>(
+    space: &Arc<dyn Space>,
+    rewrite: &ModuleRewrite,
+    invoke: &[u8],
+    host_call: F,
+) -> Vec<u8>
+where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync,
+    Fut: core::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send,
+{
     let reply = match decode::<ModuleCall>(invoke) {
         Ok(ModuleCall::Invoke {
             request,
             capability,
         }) => match space.resolve(&request, &Scope::empty()) {
             Resolution::Hit(resolved) => {
-                let issuer = ClosureHostIssuer {
-                    host_call: &host_call,
-                };
-                let inv =
-                    Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
-                match resolved.endpoint.invoke(&inv).await {
-                    Ok(representation) => ModuleReply::Resolved(representation),
-                    Err(e) => ModuleReply::Error(e.to_string()),
+                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, rewrite) {
+                    ModuleReply::Error(message)
+                } else {
+                    let issuer = ClosureHostIssuer {
+                        host_call: &host_call,
+                    };
+                    let inv =
+                        Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
+                    match resolved.endpoint.invoke(&inv).await {
+                        Ok(representation) => ModuleReply::Resolved(representation),
+                        Err(e) => ModuleReply::Error(e.to_string()),
+                    }
                 }
             }
             Resolution::Miss => ModuleReply::Error(format!(
@@ -441,6 +949,9 @@ where
             )),
         },
         Ok(ModuleCall::Describe) => ModuleReply::Bindings(space.entries()),
+        Ok(ModuleCall::Manifest) => {
+            ModuleReply::Manifest(ModuleManifest::new(space.entries(), rewrite.clone()))
+        }
         Ok(ModuleCall::HostResult(_)) => {
             ModuleReply::Error("module received HostResult before Invoke".to_string())
         }
@@ -609,6 +1120,10 @@ pub struct WasmModuleSpace {
     /// (so the ops list in the catalog) and a per-IRI `Meta` card; when empty the space
     /// behaves exactly as before (prefix routing only, no enumeration).
     endpoints: Vec<(String, Description)>,
+    /// The module's declared canonicalization, held host-side. A lazy module cannot be
+    /// asked before it is loaded — and loading it to ask would defeat the laziness — so
+    /// this arrives as static host data, like the endpoint cards beside it.
+    aliases: ModuleAliases,
 }
 
 impl WasmModuleSpace {
@@ -626,7 +1141,26 @@ impl WasmModuleSpace {
             transport,
             describe,
             endpoints: Vec::new(),
+            aliases: ModuleAliases::unknown(),
         }
+    }
+
+    /// Install the module's declared canonicalization (builder) — see [`ModuleRewrite`].
+    ///
+    /// Errors if the declared table is unparseable, or if any rule names something outside
+    /// the prefixes this space is mounted at: a module may only canonicalize names the host
+    /// routed to it. Call it after the prefixes are set, i.e. straight after
+    /// [`new`](Self::new).
+    pub fn declaring(mut self, rewrite: ModuleRewrite) -> Result<Self> {
+        self.aliases = ModuleAliases::install(&self.prefixes, rewrite)?;
+        Ok(self)
+    }
+
+    /// What to do about a module that declared [`ModuleRewrite::Undeclarable`] (builder).
+    /// Default [`OnUndeclarable::Refuse`].
+    pub fn on_undeclarable(mut self, policy: OnUndeclarable) -> Self {
+        self.aliases.policy = policy;
+        self
     }
 
     /// Declare a concrete endpoint IRI and its self-description so it **enumerates into the
@@ -656,25 +1190,28 @@ impl Space for WasmModuleSpace {
         let target = request.target.as_str();
         let matches = self.endpoints.iter().any(|(iri, _)| iri == target)
             || self.prefixes.iter().any(|p| target.starts_with(p.as_str()));
-        if matches {
-            Resolution::Hit(Resolved {
-                endpoint: Arc::new(WasmModuleEndpoint {
-                    transport: Arc::clone(&self.transport),
-                    describe: self.card_for(target),
-                }),
-                bindings: Bindings::new(),
-                // No rewrite: this space ORIGINATES a resolution. It matches the
-                // request's own target against declared endpoints or a prefix and
-                // routes it to the module unchanged, so there is no other name for
-                // the kernel to canonicalize onto. `None` here is a claim, not a
-                // default — hence the literal rather than `Resolved::new`: the next
-                // field `Resolved` grows breaks this site on purpose, so the claim
-                // gets re-read instead of silently inheriting a default.
-                canonical: None,
-            })
-        } else {
-            Resolution::Miss
+        if !matches {
+            return Resolution::Miss;
         }
+        // The canonical this space reports is the module's DECLARED rewrite, applied
+        // host-side. `None` when nothing was declared — a claim, not a default, which is
+        // why this stays a struct literal rather than `Resolved::new`: the next field
+        // `Resolved` grows breaks this site on purpose, so the claim gets re-read.
+        let canonical = match self.aliases.route(&request.target) {
+            Routing::Direct => None,
+            Routing::Canonical(iri) => Some(iri),
+            Routing::Refuse(message) => {
+                return Resolution::Hit(Resolved::new(refusing_endpoint(message), Bindings::new()))
+            }
+        };
+        Resolution::Hit(Resolved {
+            endpoint: Arc::new(WasmModuleEndpoint {
+                transport: Arc::clone(&self.transport),
+                describe: self.card_for(target),
+            }),
+            bindings: Bindings::new(),
+            canonical,
+        })
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -826,7 +1363,7 @@ macro_rules! wasm_module {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-pub use uds::{serve, UdsTransport};
+pub use uds::{serve, serve_declaring, UdsTransport};
 
 #[cfg(unix)]
 mod uds {
@@ -918,9 +1455,9 @@ mod uds {
                     }
                     ModuleReply::Resolved(representation) => return Ok(representation),
                     ModuleReply::Error(message) => return Err(Error::Endpoint(message)),
-                    ModuleReply::Bindings(_) => {
+                    ModuleReply::Bindings(_) | ModuleReply::Manifest(_) => {
                         return Err(Error::Endpoint(
-                            "module sent Bindings in reply to Invoke".to_string(),
+                            "module answered Invoke with a description".to_string(),
                         ))
                     }
                 }
@@ -937,6 +1474,20 @@ mod uds {
                 _ => None,
             }
         }
+
+        async fn manifest(&self) -> Result<ModuleManifest> {
+            let mut stream = UnixStream::connect(&self.path).map_err(io_err)?;
+            write_frame(&mut stream, &ModuleCall::Manifest).map_err(io_err)?;
+            // Connect/write failures are real errors (the module is unreachable); anything
+            // that comes back other than a `Manifest` is not. A server older than
+            // `ModuleCall::Manifest` cannot decode the frame and drops the connection, so
+            // the read EOFs — which says its NAMING is unknown, not that it does not
+            // rewrite. The module-side guard is what covers that gap.
+            Ok(match read_frame::<_, ModuleReply>(&mut stream) {
+                Ok(ModuleReply::Manifest(manifest)) => manifest,
+                _ => ModuleManifest::unknown(self.entries()),
+            })
+        }
     }
 
     /// Run `space` as a module server on `path` until an unrecoverable accept error: bind
@@ -949,6 +1500,18 @@ mod uds {
     /// permissions (the same model `ikigai-ipc` uses). Capability-based authorization
     /// (finer than per-user) layers on later.
     pub fn serve(space: Arc<dyn Space>, path: &Path) -> io::Result<()> {
+        serve_declaring(space, ModuleRewrite::Unknown, path)
+    }
+
+    /// [`serve`], for a module whose space **rewrites names**: it answers
+    /// [`ModuleCall::Manifest`] with `rewrite`, so a host can install the module's
+    /// canonicalization and share one identity with it. `serve` declares
+    /// [`ModuleRewrite::Unknown`] — truthfully, since it was told nothing.
+    pub fn serve_declaring(
+        space: Arc<dyn Space>,
+        rewrite: ModuleRewrite,
+        path: &Path,
+    ) -> io::Result<()> {
         let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -959,7 +1522,8 @@ mod uds {
                 continue; // not our user — drop it
             }
             let space = Arc::clone(&space);
-            std::thread::spawn(move || serve_connection(space, stream));
+            let rewrite = rewrite.clone();
+            std::thread::spawn(move || serve_connection(space, rewrite, stream));
         }
         Ok(())
     }
@@ -1008,7 +1572,11 @@ mod uds {
 
     /// Serve one connection: run a module session per `Invoke` until the peer hangs up.
     /// `pub(crate)` so a test can drive a single accepted connection directly.
-    pub(crate) fn serve_connection(space: Arc<dyn Space>, stream: UnixStream) {
+    pub(crate) fn serve_connection(
+        space: Arc<dyn Space>,
+        rewrite: ModuleRewrite,
+        stream: UnixStream,
+    ) {
         loop {
             let call: ModuleCall = match read_frame(&mut &stream) {
                 Ok(call) => call,
@@ -1018,8 +1586,13 @@ mod uds {
                 ModuleCall::Invoke {
                     request,
                     capability,
-                } => futures::executor::block_on(run_session(&space, &stream, request, capability)),
+                } => futures::executor::block_on(run_session(
+                    &space, &rewrite, &stream, request, capability,
+                )),
                 ModuleCall::Describe => ModuleReply::Bindings(space.entries()),
+                ModuleCall::Manifest => {
+                    ModuleReply::Manifest(ModuleManifest::new(space.entries(), rewrite.clone()))
+                }
                 ModuleCall::HostResult(_) => {
                     ModuleReply::Error("server received HostResult before Invoke".to_string())
                 }
@@ -1035,12 +1608,16 @@ mod uds {
     /// `HostCall`/`HostResult` on `stream`.
     async fn run_session(
         space: &Arc<dyn Space>,
+        rewrite: &ModuleRewrite,
         stream: &UnixStream,
         request: Request,
         capability: Capability,
     ) -> ModuleReply {
         match space.resolve(&request, &Scope::empty()) {
             Resolution::Hit(resolved) => {
+                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, rewrite) {
+                    return ModuleReply::Error(message);
+                }
                 let issuer = SocketHostIssuer { stream };
                 let inv =
                     Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
@@ -1102,10 +1679,19 @@ mod uds {
 pub struct ModuleSpace {
     prefixes: Vec<String>,
     transport: Arc<dyn ModuleTransport>,
+    aliases: ModuleAliases,
 }
 
 impl ModuleSpace {
-    /// Route every IRI starting with one of `prefixes` to `transport`.
+    /// Route every IRI starting with one of `prefixes` to `transport`, **without asking
+    /// the module how it names things**.
+    ///
+    /// Correct for the overwhelmingly common module, which resolves every target under the
+    /// name it was given. For a module that composes a rewriting space, prefer
+    /// [`connect`](Self::connect): this constructor records
+    /// [`ModuleRewrite::Unknown`], so the host shares no identity with the module and the
+    /// module side refuses any invocation whose resolution reports a rewrite (see
+    /// [`ModuleRewrite`]).
     pub fn new(
         prefixes: impl IntoIterator<Item = impl Into<String>>,
         transport: Arc<dyn ModuleTransport>,
@@ -1113,29 +1699,82 @@ impl ModuleSpace {
         Self {
             prefixes: prefixes.into_iter().map(Into::into).collect(),
             transport,
+            aliases: ModuleAliases::unknown(),
         }
+    }
+
+    /// Ask the module for its [`ModuleManifest`] and install the canonicalization it
+    /// declares — the mount-time round trip that lets a module compose a rewriting space.
+    ///
+    /// This is the one place the module is asked, and it is asked **once**: from here on
+    /// the rewrite is applied by the host, synchronously, inside `Space::resolve`, and
+    /// reported on [`Resolved::canonical`], so the kernel's cache key, golden-thread cut
+    /// and capability floor all name the backing resource. Asking per-resolution is what
+    /// the synchronous `Space::resolve` signature forbids.
+    ///
+    /// Errors if the module's declared table is unparseable or names anything outside
+    /// `prefixes` — at mount time, where an operator is watching.
+    pub async fn connect(
+        prefixes: impl IntoIterator<Item = impl Into<String>>,
+        transport: Arc<dyn ModuleTransport>,
+    ) -> Result<Self> {
+        let prefixes: Vec<String> = prefixes.into_iter().map(Into::into).collect();
+        let manifest = transport.manifest().await?;
+        let aliases = ModuleAliases::install(&prefixes, manifest.rewrite)?;
+        Ok(Self {
+            prefixes,
+            transport,
+            aliases,
+        })
+    }
+
+    /// Install a declaration the host already holds, without asking (builder). Same
+    /// validation as [`connect`](Self::connect).
+    pub fn declaring(mut self, rewrite: ModuleRewrite) -> Result<Self> {
+        self.aliases = ModuleAliases::install(&self.prefixes, rewrite)?;
+        Ok(self)
+    }
+
+    /// What to do about a module that declared [`ModuleRewrite::Undeclarable`] (builder).
+    /// Default [`OnUndeclarable::Refuse`].
+    pub fn on_undeclarable(mut self, policy: OnUndeclarable) -> Self {
+        self.aliases.policy = policy;
+        self
+    }
+
+    /// What the module said about how it names things.
+    pub fn rewrite(&self) -> &ModuleRewrite {
+        &self.aliases.rewrite
     }
 }
 
 impl Space for ModuleSpace {
     fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
         let target = request.target.as_str();
-        if self.prefixes.iter().any(|p| target.starts_with(p.as_str())) {
-            // (A real host also *triggers lazy instantiation* of the module here.)
-            Resolution::Hit(Resolved {
-                endpoint: Arc::new(ModuleEndpoint {
-                    transport: Arc::clone(&self.transport),
-                }),
-                bindings: Bindings::new(),
-                // No rewrite: prefix match routes the request's own target to the
-                // module untouched, so this resolution has no canonical name to
-                // report. See the note on `WasmModuleSpace::resolve` for why this
-                // stays a struct literal — the compile break IS the review trigger.
-                canonical: None,
-            })
-        } else {
-            Resolution::Miss
+        if !self.prefixes.iter().any(|p| target.starts_with(p.as_str())) {
+            return Resolution::Miss;
         }
+        // ★ The module's declared rewrite, applied HERE — host-side, synchronously, by the
+        // kernel's own `AliasTable`. The canonical rides back on the `Resolved` and the
+        // kernel adopts it before it computes the request id, so the logical and backing
+        // names are ONE cache entry and ONE golden thread across the module boundary.
+        // `None` when nothing was declared: a claim, not a default, which is why this stays
+        // a struct literal — the compile break IS the review trigger.
+        let canonical = match self.aliases.route(&request.target) {
+            Routing::Direct => None,
+            Routing::Canonical(iri) => Some(iri),
+            Routing::Refuse(message) => {
+                return Resolution::Hit(Resolved::new(refusing_endpoint(message), Bindings::new()))
+            }
+        };
+        // (A real host also *triggers lazy instantiation* of the module here.)
+        Resolution::Hit(Resolved {
+            endpoint: Arc::new(ModuleEndpoint {
+                transport: Arc::clone(&self.transport),
+            }),
+            bindings: Bindings::new(),
+            canonical,
+        })
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -1188,9 +1827,10 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{
-        ArgRef, ArgSpec, Description, EndpointSpace, Exact, Fallback, FnEndpoint, Iri, Kernel,
-        MetaRenderer, ReprType, Verb,
+        Alias, ArgRef, ArgSpec, Description, EndpointSpace, Exact, Fallback, Kernel, MetaRenderer,
+        ReprType, Rewrite, Verb,
     };
+    use std::sync::Mutex;
 
     // A tiny meta renderer so the test kernel can describe endpoints if asked.
     struct PlainRenderer;
@@ -1224,8 +1864,14 @@ mod tests {
                 out.extend_from_slice(&inv.source(&iri).await?.bytes);
             }
             // Cacheable, so the result inherits both sub-resources' golden threads —
-            // exactly the host-side caching a real module relies on.
-            Ok(Representation::new(ReprType::new("text/plain"), out).cacheable())
+            // exactly the host-side caching a real module relies on. It also declares a
+            // thread named after the resource it *is*, which is what a module writing
+            // through its own name would cut: that thread is the module's answer to "what
+            // did I resolve?", so the rewriting tests can cut the backing name and watch
+            // an entry created through the logical name go.
+            Ok(Representation::new(ReprType::new("text/plain"), out)
+                .cacheable()
+                .depends_on(inv.request.target.as_str()))
         }
 
         fn name(&self) -> &str {
@@ -1246,12 +1892,31 @@ mod tests {
     // into a local host space, so the ONLY way its endpoint resolves `a`/`b` is by
     // calling back to the host.
     fn stub_module() -> EndpointSpace {
-        EndpointSpace::new().bind(Exact::new("urn:stub:concat"), ConcatEndpoint)
+        EndpointSpace::new()
+            .bind(Exact::new("urn:stub:concat"), ConcatEndpoint)
+            // Reports the name it was invoked under. The one-line answer to "did the host
+            // canonicalize before it resolved?", and it works over every transport because
+            // the target rides in the `Request`, which does serialize.
+            .bind(
+                Exact::new("urn:stub:whoami"),
+                FnEndpoint::new("stub-whoami", |inv: &Invocation<'_>| {
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        inv.request.target.as_str().as_bytes().to_vec(),
+                    ))
+                }),
+            )
     }
 
+    // A fixed host resource, declaring a golden thread named after itself — the ordinary
+    // convention, and what lets a test cut one of the module's dependencies.
     fn fixed(name: &'static str, media: &'static str, body: &'static str) -> FnEndpoint {
-        FnEndpoint::new(name, move |_inv: &Invocation<'_>| {
-            Ok(Representation::new(ReprType::new(media), body.as_bytes().to_vec()).cacheable())
+        FnEndpoint::new(name, move |inv: &Invocation<'_>| {
+            Ok(
+                Representation::new(ReprType::new(media), body.as_bytes().to_vec())
+                    .cacheable()
+                    .depends_on(inv.request.target.as_str()),
+            )
         })
     }
 
@@ -1401,6 +2066,7 @@ mod tests {
             .unwrap();
         block_on(run_module_session(
             Arc::new(stub_module()),
+            ModuleRewrite::None,
             host_to_module_rx,
             module_to_host_tx,
         ));
@@ -1625,6 +2291,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_uds_module_declares_its_rewrite_over_the_socket() {
+        // The closest thing in this crate to a Phase-2 transport: the declaration crosses a
+        // real socket as a framed `Manifest`, the host installs it, and the same one-identity
+        // property holds. Each `invoke` opens its own connection, so the server runs its
+        // normal accept loop rather than the single-connection harness below.
+        use std::thread;
+        use std::time::Duration;
+
+        let path = std::env::temp_dir().join(format!(
+            "ikigai-module-uds-alias-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let table = join_table();
+        let space = aliasing_module(&table);
+        let rewrite = ModuleRewrite::from_table(&table);
+        let served = path.clone();
+        thread::spawn(move || {
+            let _ = crate::uds::serve_declaring(space, rewrite, &served);
+        });
+        // The listener is bound on another thread; wait for the socket to appear rather
+        // than racing it.
+        for _ in 0..400 {
+            if path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let transport = Arc::new(crate::uds::UdsTransport::connect(&path));
+        let module = block_on(ModuleSpace::connect(["urn:stub:"], transport))
+            .expect("mount the socket-served module");
+        assert_eq!(module.rewrite(), &ModuleRewrite::from_table(&table));
+        assert_one_identity_across_the_boundary(&kernel_with(module));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn module_session_round_trips_over_a_unix_socket() {
         use std::os::unix::net::UnixListener;
         use std::thread;
@@ -1638,7 +2344,7 @@ mod tests {
         let space: Arc<dyn Space> = Arc::new(stub_module());
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            crate::uds::serve_connection(space, stream);
+            crate::uds::serve_connection(space, ModuleRewrite::None, stream);
         });
 
         // Host kernel: urn:stub:* routed to the module over the socket; the two refs it
@@ -1695,5 +2401,401 @@ mod tests {
         );
         drop(client);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- ★ A module composing a REWRITING space -----------------------------------------
+    //
+    // The acceptance property: an `Alias` installed inside the module's own space gives
+    // the logical and the backing name ONE cache entry and ONE golden thread on the host,
+    // the same property core proved for an alias nested under a local overlay. Proved over
+    // the in-process transport AND the loopback, because only the second shows the
+    // declaration surviving the codec.
+
+    // The module's table: `urn:stub:join` is the logical name, `urn:stub:concat` the
+    // backing one. Built once and shared between the module's `Alias` and the declaration
+    // handed to the transport — the pairing that keeps the two from drifting.
+    fn join_table() -> Arc<AliasTable> {
+        Arc::new(
+            AliasTable::new()
+                .exact("urn:stub:join", "urn:stub:concat")
+                .exact("urn:stub:me", "urn:stub:whoami"),
+        )
+    }
+
+    /// The stub module's space with that alias composed into it.
+    fn aliasing_module(table: &Arc<AliasTable>) -> Arc<dyn Space> {
+        Arc::new(Alias::new(Arc::clone(table), Arc::new(stub_module())))
+    }
+
+    /// The same request as `concat_request`, under the module's LOGICAL name.
+    fn join_request() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:stub:join").unwrap())
+            .with_arg("a", ArgRef::Inline(b"urn:test:greeting".to_vec()))
+            .with_arg("b", ArgRef::Inline(b"urn:test:subject".to_vec()))
+    }
+
+    /// `urn:stub:whoami` under its logical name.
+    fn me_request() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:stub:me").unwrap())
+    }
+
+    /// A host kernel with the two callback resources plus `module` in its root.
+    fn kernel_with(module: ModuleSpace) -> Kernel {
+        let host_space = EndpointSpace::new()
+            .bind(
+                Exact::new("urn:test:greeting"),
+                fixed("greeting", "text/plain", "hello, "),
+            )
+            .bind(
+                Exact::new("urn:test:subject"),
+                fixed("subject", "text/plain", "module"),
+            );
+        let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
+            Arc::new(host_space) as Arc<dyn Space>,
+            Arc::new(module) as Arc<dyn Space>,
+        ]));
+        Kernel::with_meta_renderer(root, Arc::new(PlainRenderer))
+    }
+
+    /// Mount a module that aliases, declaring the table it aliases through.
+    fn declared_module(transport: Arc<dyn ModuleTransport>) -> ModuleSpace {
+        block_on(ModuleSpace::connect(["urn:stub:"], transport)).expect("connect to the module")
+    }
+
+    /// The acceptance assertions, run against whichever transport carried the declaration.
+    fn assert_one_identity_across_the_boundary(kernel: &Kernel) {
+        let cap = Capability::root();
+
+        // The module's endpoint runs under the BACKING name. The host canonicalized from
+        // the module's own declaration before it resolved, so the `Request` that crossed
+        // the boundary names the resource actually reached — which is what makes the
+        // module's own `Alias` a no-op on the way in, and what the kernel's `Meta`,
+        // capability floor and trace all agree on.
+        let who = block_on(kernel.issue(me_request(), &cap)).expect("aliased whoami");
+        assert_eq!(String::from_utf8(who.bytes).unwrap(), "urn:stub:whoami");
+
+        // Issue under the LOGICAL name: it works, and it is filed under the BACKING one,
+        // because `ModuleSpace` reported the canonical and the kernel adopted it before it
+        // computed the request id.
+        let rep = block_on(kernel.issue(join_request(), &cap)).expect("aliased module invoke");
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
+        assert!(
+            kernel.is_cached(&concat_request(), &cap),
+            "the logical name's result is cached under the BACKING name"
+        );
+        let entries = kernel.cache_len();
+
+        // ONE cache entry: issuing under the backing name serves that same entry instead
+        // of making a second. (Before the declaration crossed the boundary this was two
+        // entries over one resource, and nothing anywhere said so.)
+        let again = block_on(kernel.issue(concat_request(), &cap)).expect("backing-name invoke");
+        assert_eq!(String::from_utf8(again.bytes).unwrap(), "hello, module");
+        assert_eq!(
+            kernel.cache_len(),
+            entries,
+            "the backing name must not create a second entry"
+        );
+
+        // ONE golden thread: because there is one entry, there is one thread set — the
+        // provenance of the resolution that filled it. Cutting a dependency reaches what
+        // was cached through either name.
+        kernel.cut("urn:test:greeting");
+        assert!(
+            !kernel.is_cached(&concat_request(), &cap),
+            "a cut reaches the single entry both names index"
+        );
+    }
+
+    #[test]
+    fn an_alias_inside_a_module_shares_one_identity_in_process() {
+        let table = join_table();
+        let transport = Arc::new(
+            InProcessTransport::from_arc(aliasing_module(&table))
+                .declaring(ModuleRewrite::from_table(&table)),
+        );
+        assert_one_identity_across_the_boundary(&kernel_with(declared_module(transport)));
+    }
+
+    #[test]
+    fn an_alias_inside_a_module_shares_one_identity_over_the_codec() {
+        // Same property, but the declaration reached the host as postcard bytes over the
+        // loopback's `Manifest` exchange — which is what a socket or wasm transport does.
+        let table = join_table();
+        let transport = Arc::new(
+            LoopbackTransport::from_arc(aliasing_module(&table))
+                .declaring(ModuleRewrite::from_table(&table)),
+        );
+        assert_one_identity_across_the_boundary(&kernel_with(declared_module(transport)));
+    }
+
+    #[test]
+    fn a_thread_the_module_declares_names_the_backing_resource() {
+        // The stronger form of "one golden thread", and the one an operator actually
+        // relies on: the thread the module's endpoint DECLARED is the backing name, so a
+        // cut naming the backing resource invalidates what the logical name cached.
+        //
+        // ⚠ In-process only, and not because of anything in this arc: a module's
+        // `Representation::threads` is `serde(skip)`, so a wire transport drops the
+        // module's own declared threads entirely and invalidation over the wire rides on
+        // the host callbacks' provenance instead. Worth knowing before a module is written
+        // that declares a thread nothing else touches.
+        let table = join_table();
+        let transport = Arc::new(
+            InProcessTransport::from_arc(aliasing_module(&table))
+                .declaring(ModuleRewrite::from_table(&table)),
+        );
+        let kernel = kernel_with(declared_module(transport));
+        let cap = Capability::root();
+        block_on(kernel.issue(join_request(), &cap)).expect("aliased module invoke");
+        assert!(kernel.is_cached(&concat_request(), &cap));
+
+        // The logical name is NOT the thread — nothing was ever filed under it.
+        kernel.cut("urn:stub:join");
+        assert!(
+            kernel.is_cached(&concat_request(), &cap),
+            "cutting the logical name touches nothing, because the resource is the backing one"
+        );
+        kernel.cut("urn:stub:concat");
+        assert!(
+            !kernel.is_cached(&concat_request(), &cap),
+            "the module declared its thread under the backing name"
+        );
+    }
+
+    #[test]
+    fn the_declaration_survives_the_codec() {
+        // The narrow claim the test above depends on: `ModuleRewrite` round-trips through
+        // postcard as part of a real `Manifest`/`Manifest` exchange, and parses back into
+        // the table it was built from.
+        let table = join_table();
+        let transport = LoopbackTransport::from_arc(aliasing_module(&table))
+            .declaring(ModuleRewrite::from_table(&table));
+        let manifest = block_on(transport.manifest()).expect("manifest over the codec");
+        assert_eq!(manifest.rewrite, ModuleRewrite::from_table(&table));
+        let parsed = manifest
+            .rewrite
+            .table()
+            .expect("the declared table parses")
+            .expect("a table was declared");
+        assert_eq!(parsed.rules().len(), 2);
+        assert_eq!(
+            parsed
+                .canonicalize(&Iri::parse("urn:stub:join").unwrap())
+                .canonical()
+                .map(Iri::as_str),
+            Some("urn:stub:concat"),
+        );
+        // And the bindings still ride along, so a host mounting a module asks once.
+        assert_eq!(
+            manifest.entries.as_deref(),
+            Some(
+                &[
+                    SpaceEntry::new("urn:stub:concat", "stub-concat"),
+                    SpaceEntry::new("urn:stub:whoami", "stub-whoami"),
+                ][..]
+            ),
+        );
+    }
+
+    // --- ★ The signal: an undeclared or undeclarable rewrite is never silent -------------
+
+    /// Mount an aliasing module WITHOUT telling the host, and try the logical name.
+    fn undeclared_error(transport: Arc<dyn ModuleTransport>) -> String {
+        let kernel = kernel_with(ModuleSpace::new(["urn:stub:"], transport));
+        let err = block_on(kernel.issue(join_request(), &Capability::root()))
+            .expect_err("an undeclared rewrite must not be served");
+        assert!(
+            !kernel.is_cached(&concat_request(), &Capability::root()),
+            "a refused invocation caches nothing under either name"
+        );
+        err.to_string()
+    }
+
+    #[test]
+    fn an_undeclared_rewrite_is_refused_rather_than_split_in_two() {
+        // `ModuleSpace::new` never asked, so the host holds `Unknown` and resolves under
+        // the name it was given. The module then resolves under a DIFFERENT name and says
+        // so on `Resolved::canonical` — which the host can no longer act on, its cache key
+        // and thread already fixed. The module side refuses, naming both names, instead of
+        // returning a right-looking answer filed under the wrong one.
+        let table = join_table();
+        for message in [
+            undeclared_error(Arc::new(InProcessTransport::from_arc(aliasing_module(
+                &table,
+            )))),
+            undeclared_error(Arc::new(LoopbackTransport::from_arc(aliasing_module(
+                &table,
+            )))),
+        ] {
+            assert!(message.contains("urn:stub:join"), "{message}");
+            assert!(message.contains("urn:stub:concat"), "{message}");
+            assert!(message.contains("never declared"), "{message}");
+        }
+    }
+
+    #[test]
+    fn declaring_none_is_a_claim_and_a_module_that_breaks_it_is_refused() {
+        // `None` is not "say nothing" — it is "I resolve every target under the name you
+        // gave me". A module that then rewrites has broken its own declaration, and the
+        // guard says so exactly as it does for `Unknown`.
+        let table = join_table();
+        let transport = Arc::new(
+            InProcessTransport::from_arc(aliasing_module(&table)).declaring(ModuleRewrite::None),
+        );
+        let module = declared_module(transport);
+        assert_eq!(module.rewrite(), &ModuleRewrite::None);
+        let kernel = kernel_with(module);
+        let err = block_on(kernel.issue(join_request(), &Capability::root()))
+            .expect_err("a broken `None` declaration must be refused");
+        assert!(err.to_string().contains("never declared"), "{err}");
+    }
+
+    /// A module that rewrites through an arbitrary closure — the shape that provably
+    /// cannot be written down as a table, and so must be declared `Undeclarable`.
+    fn undeclarable_module() -> Arc<dyn Space> {
+        Arc::new(Rewrite::new(Arc::new(stub_module()), |iri| {
+            (iri.as_str() == "urn:stub:join").then(|| Iri::parse("urn:stub:concat").unwrap())
+        }))
+    }
+
+    #[test]
+    fn an_undeclarable_rewrite_is_refused_by_default() {
+        let transport = Arc::new(
+            InProcessTransport::from_arc(undeclarable_module()).declaring(
+                ModuleRewrite::Undeclarable("rewrites through a host-supplied closure".to_string()),
+            ),
+        );
+        let kernel = kernel_with(declared_module(transport));
+        let err = block_on(kernel.issue(join_request(), &Capability::root()))
+            .expect_err("an undeclarable rewrite is refused by default");
+        let message = err.to_string();
+        assert!(message.contains("cannot declare"), "{message}");
+        assert!(message.contains("host-supplied closure"), "{message}");
+    }
+
+    #[test]
+    fn an_undeclarable_rewrite_can_be_accepted_out_loud() {
+        // The other legitimate answer: accept the split, but say so. The host supplies a
+        // sink and gets one line per affected resolution — the difference between an
+        // operator who knows identity is split here and 0.1.9, where nobody did.
+        let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&warnings);
+        let transport = Arc::new(
+            InProcessTransport::from_arc(undeclarable_module()).declaring(
+                ModuleRewrite::Undeclarable("rewrites through a host-supplied closure".to_string()),
+            ),
+        );
+        let module = declared_module(transport).on_undeclarable(OnUndeclarable::Warn(Arc::new(
+            move |message: &str| sink.lock().unwrap().push(message.to_string()),
+        )));
+        let kernel = kernel_with(module);
+        let rep = block_on(kernel.issue(join_request(), &Capability::root()))
+            .expect("accepted, so it resolves");
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("cannot declare"), "{warnings:?}");
+        // And the split it warned about is real: the answer is filed under the LOGICAL
+        // name, because that is the only name the host ever knew.
+        assert!(kernel.is_cached(&join_request(), &Capability::root()));
+        assert!(!kernel.is_cached(&concat_request(), &Capability::root()));
+    }
+
+    // --- Mount-time validation: a declaration is checked where an operator is watching ---
+
+    #[test]
+    fn a_rewrite_pointing_outside_the_modules_prefixes_is_refused_at_mount_time() {
+        // The rewrite the host installs decides the kernel's IDENTITY for the request, so
+        // a rule pointing outside the namespace the host routed to this module is a claim
+        // on a name the module was never given.
+        let transport = Arc::new(InProcessTransport::new(stub_module()));
+        let err = ModuleSpace::new(["urn:stub:"], transport)
+            .declaring(ModuleRewrite::Table(
+                "exact urn:stub:join urn:test:greeting\n".to_string(),
+            ))
+            .map(|_| ())
+            .expect_err("a rule leaving the module's namespace must not mount");
+        assert!(err.to_string().contains("outside the prefixes"), "{err}");
+    }
+
+    #[test]
+    fn a_rewrite_naming_the_kernel_namespace_is_refused_at_mount_time() {
+        let transport = Arc::new(InProcessTransport::new(stub_module()));
+        let err = ModuleSpace::new(["urn:stub:", "urn:kernel:"], transport)
+            .declaring(ModuleRewrite::Table(
+                "exact urn:stub:join urn:kernel:cut\n".to_string(),
+            ))
+            .map(|_| ())
+            .expect_err("the reserved namespace is not aliasable");
+        assert!(
+            err.to_string().contains("reserved kernel namespace"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_declared_table_is_refused_at_mount_time() {
+        let transport = Arc::new(InProcessTransport::new(stub_module()));
+        let err = ModuleSpace::new(["urn:stub:"], transport)
+            .declaring(ModuleRewrite::Table("wobble urn:stub:join\n".to_string()))
+            .map(|_| ())
+            .expect_err("a malformed table fails when it is read");
+        assert!(err.to_string().contains("unparseable"), "{err}");
+    }
+
+    // --- Wire compatibility with 0.1.9 --------------------------------------------------
+
+    #[test]
+    fn the_0_1_9_message_bytes_are_unchanged() {
+        // postcard keys an enum on its variant INDEX, so the whole compatibility claim is
+        // "the new variants were appended". Pinned here because nothing else would notice
+        // a variant inserted in the middle — it would just start decoding as another
+        // message.
+        assert_eq!(encode(&ModuleCall::Describe).unwrap(), vec![2]);
+        assert_eq!(encode(&ModuleCall::Manifest).unwrap(), vec![3]);
+        assert_eq!(encode(&ModuleReply::Bindings(None)).unwrap(), vec![3, 0]);
+        assert_eq!(
+            encode(&ModuleReply::Manifest(ModuleManifest::unknown(None)))
+                .unwrap()
+                .first(),
+            Some(&4),
+        );
+        // And from the other direction: bytes a 0.1.9 peer would have written still decode
+        // to the message they meant.
+        assert!(matches!(
+            decode::<ModuleCall>(&[2]).unwrap(),
+            ModuleCall::Describe
+        ));
+        assert!(matches!(
+            decode::<ModuleReply>(&[3, 0]).unwrap(),
+            ModuleReply::Bindings(None)
+        ));
+    }
+
+    #[test]
+    fn a_transport_that_cannot_answer_reports_unknown_not_none() {
+        // The default `manifest()` — what a third-party transport and every 0.1.9 peer
+        // gives. `Unknown` is the absence of a claim; reading it as `None` ("does not
+        // rewrite") is precisely the silent split this arc removes.
+        struct BareTransport;
+
+        #[async_trait]
+        impl ModuleTransport for BareTransport {
+            async fn invoke(
+                &self,
+                _request: Request,
+                _capability: &Capability,
+                _host: &dyn Issuer,
+            ) -> Result<Representation> {
+                unreachable!()
+            }
+        }
+
+        let manifest = block_on(BareTransport.manifest()).unwrap();
+        assert_eq!(manifest.rewrite, ModuleRewrite::Unknown);
+        assert!(!manifest.rewrite.is_declared());
+        let module = block_on(ModuleSpace::connect(["urn:stub:"], Arc::new(BareTransport)))
+            .expect("mounting an unasked module still works");
+        assert_eq!(module.rewrite(), &ModuleRewrite::Unknown);
     }
 }

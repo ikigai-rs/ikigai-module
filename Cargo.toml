@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-module"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -15,6 +15,10 @@ keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 # not compile before that field exists. The earlier floor was 0.1.46 = `SpaceEntry::new`
 # (the federated-catalog `origin` field made THAT struct literal a break) — the same event,
 # twice. Both times the break is what surfaced the sites, so the literals stay literals.
+# 0.1.64 is also the floor for the rest of the rewrite story a module now declares:
+# `AliasTable::{parse, to_text}` (the declaration's text form on the wire), `AliasRule`'s
+# accessors (mount-time validation) and `Canonical` — plus, decisively, the kernel ADOPTING
+# a reported canonical, without which a declared rewrite would resolve and still split.
 ikigai-core = "0.1.64"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
