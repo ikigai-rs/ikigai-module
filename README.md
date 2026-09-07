@@ -28,6 +28,7 @@ module's result is cached and invalidated exactly as a statically-linked space w
 | `UdsTransport` / `serve` | both | The first real home: the module runs out-of-process behind a peercred-guarded Unix socket, driven over framed socket I/O. |
 | `WasmModuleSpace` / `wasm_module!` | both | The lazy browser module: one macro line emits the artifact's glue, one `WasmModuleSpace` binds it host-side. |
 | `ModuleRewrite` / `ModuleManifest` | wire | How the module **names** things — what lets it compose a rewriting space (see below). |
+| `ModuleFloor` | host | What the mount **may do** — the capability floor every non-`Meta` verb under it requires. The host's word, not the module's (see below). |
 
 ## Why a session, not a round-trip
 
@@ -44,13 +45,14 @@ Mount a module's `space()` behind its prefixes in the kernel's root `Fallback`:
 ```rust
 use std::sync::Arc;
 use ikigai_core::{Fallback, Space};
-use ikigai_module::{ModuleSpace, InProcessTransport};
+use ikigai_module::{InProcessTransport, ModuleFloor, ModuleSpace};
 
 let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
     Arc::new(local_space) as Arc<dyn Space>,
     Arc::new(ModuleSpace::new(
         ["urn:xslt:"],
         Arc::new(InProcessTransport::new(ikigai_xslt::space())),
+        ModuleFloor::requiring("urn:cap:xslt"),   // ← what this mount may do
     )) as Arc<dyn Space>,
     // …
 ]));
@@ -60,6 +62,53 @@ The module's endpoints can now resolve `urn:xslt:` IRIs, and any `inv.source(..)
 make crosses back through the host kernel — so a module endpoint that joins two
 host-resolved resources inherits both of their golden threads, and the host caches the
 combined result. (See the crate's tests for that end-to-end.)
+
+## The module says what it does; the host says what it may do
+
+`Endpoint::describe()` is what the kernel enforces — *declared capabilities = enforced
+capabilities* — and across a module boundary that card has to be authored by the **host**.
+The module is the untrusted party here: if its own `requires` were the source of the
+enforced requirement, a module declaring none would thereby become ungated and
+under-declaring would be the escape hatch. Authority is never self-asserted by the thing
+being gated.
+
+So every mount carries a `ModuleFloor`: the scopes every non-`Meta` verb under it requires,
+whatever the module says about itself.
+
+```rust
+use ikigai_core::{Description, Verb};
+use ikigai_module::{ModuleFloor, ModuleSpace};
+
+let mount = ModuleSpace::new(["urn:xslt:"], transport, ModuleFloor::requiring("urn:cap:xslt"))
+    // A per-endpoint card REFINES the floor — it can add scopes, never remove them.
+    .with_endpoint(
+        "urn:xslt:transform",
+        Description::new("xslt-transform").verb(Verb::Source).requires("urn:cap:net:*"),
+    );
+```
+
+Three properties, all of them the point:
+
+- **An IRI with no card is gated exactly as strictly as one with.** The floor is folded into
+  every card the mount hands the kernel, including the generic prefix fallback — so
+  *forgetting* to enumerate an endpoint can never buy less gating. That fallback was the
+  defect: it carried no `requires` at all, so an endpoint declaring
+  `.requires("urn:cap:demo:greet")` resolved under a capability granting only
+  `urn:cap:demo:read`, while the identical declaration on a *linked* endpoint was denied.
+- **A module that declares nothing does not thereby become ungated.** The floor is the
+  host's word and the module has no way to lower it.
+- **The ungated mount is a sentence you write, never one you omit.** `ModuleFloor` has no
+  `Default` and every mount constructor takes one by value, so `ModuleFloor::public()` is a
+  deliberate, greppable assertion.
+
+Beside the floor, the module also **honors its own card**: a module-side endpoint declaring
+`requires` is checked against the caller's capability at every dispatch site, over every
+transport. That can only ever deny *more* than the floor already denies, so it is safe to
+trust — and it means one `.requires(..)` declaration means the same thing whether an
+endpoint is linked or loaded.
+
+`Meta` is exempt, exactly as it is in the kernel: self-description stays readable wherever
+the catalog offers it, so an agent can still learn what it would need in order to ask.
 
 ## Composing a rewriting space in a module
 
@@ -78,7 +127,7 @@ So the module **declares** how it names things, and the host applies it locally:
 ```rust
 use std::sync::Arc;
 use ikigai_core::{Alias, AliasTable, Space};
-use ikigai_module::{InProcessTransport, ModuleRewrite, ModuleSpace};
+use ikigai_module::{InProcessTransport, ModuleFloor, ModuleRewrite, ModuleSpace};
 
 // One table, used twice: the module rewrites through it, and declares it.
 let table = Arc::new(AliasTable::new().prefix("urn:xslt:v1:", "urn:xslt:"));
@@ -88,7 +137,7 @@ let transport = Arc::new(
 );
 
 // `connect` asks once, at mount time, and installs the declaration in the host's own table.
-let module = ModuleSpace::connect(["urn:xslt:"], transport).await?;
+let module = ModuleSpace::connect(["urn:xslt:"], transport, ModuleFloor::requiring("urn:cap:xslt")).await?;
 ```
 
 From there the rewrite is applied **host-side, synchronously, inside `Space::resolve`** by
