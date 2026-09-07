@@ -36,6 +36,27 @@
 //!   the host registers it with one `WasmModuleSpace::new` + a `serve_host_call` in its
 //!   `hostCall` export — no hand-written wrapper crate or per-module endpoint.
 //!
+//! ## The module says what it does; the host says what it may do
+//!
+//! The kernel enforces exactly what `Endpoint::describe()` returns (*declared capabilities =
+//! enforced capabilities*), and across this boundary that card must be authored by the
+//! **host**. The module is the untrusted party: were its own `requires` the source of the
+//! enforced requirement, a module declaring none would thereby become ungated and
+//! under-declaring would be the escape hatch. Authority is never self-asserted by the thing
+//! being gated.
+//!
+//! So every mount carries a [`ModuleFloor`] — the scopes every non-`Meta` verb under it
+//! requires, folded into every card the mount hands the kernel (the enumerated ones from
+//! [`ModuleSpace::with_endpoint`] *and* the generic prefix fallback) and checked host-side
+//! before anything crosses the boundary. A card refines the floor; it never lowers it, an
+//! IRI nobody enumerated is gated exactly as strictly as one that was, and the ungated mount
+//! is a sentence a host writes ([`ModuleFloor::public`]) rather than one it omits.
+//!
+//! Beside it, the module **honors its own card** at every dispatch site
+//! (`refuse_unsatisfied_declaration`), which can only ever deny *more* than the floor — so
+//! one `.requires(..)` declaration means the same thing whether an endpoint is linked or
+//! loaded.
+//!
 //! ## A module may compose a rewriting space
 //!
 //! Any space should be composable in any module — including one that resolves one name
@@ -65,7 +86,7 @@ use futures::StreamExt;
 use ikigai_core::{
     AliasParseError, AliasTable, Bindings, Canonical, Capability, Description, Endpoint, Error,
     Expiry, FnEndpoint, Invocation, Iri, Issuer, Representation, Request, Resolution, Resolved,
-    Result, Scope, Space, SpaceEntry, Thread,
+    Result, Scope, Space, SpaceEntry, Thread, Verb,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -120,6 +141,12 @@ pub enum ModuleReply {
     /// The invocation finished with a representation.
     Resolved(Representation),
     /// The invocation failed.
+    ///
+    /// ⚠ A string, so the error's **type** does not cross the wire: a module-side denial
+    /// (`refuse_unsatisfied_declaration`) arrives at the host as [`Error::Endpoint`], not
+    /// [`Error::Denied`] — and only `Denied` is permanent, so a retrying caller may treat a
+    /// refusal as transient. The mount's [`ModuleFloor`] is unaffected: it is checked
+    /// host-side, on this side of the wire, and returns a real `Error::Denied`.
     Error(String),
     /// The answer to a [`ModuleCall::Describe`].
     Bindings(Option<Vec<SpaceEntry>>),
@@ -341,6 +368,202 @@ fn refusing_endpoint(message: String) -> Arc<dyn Endpoint> {
     Arc::new(FnEndpoint::new("module-refused", move |_inv| {
         Err(Error::Endpoint(message.clone()))
     }))
+}
+
+// ---------------------------------------------------------------------------
+// ★ The capability floor — the HOST's answer to "what may this module do?"
+//
+// The kernel enforces exactly what `Endpoint::describe()` returns (`declared = enforced`),
+// and for a module endpoint that card must be authored by the HOST, not the module. A
+// module is the untrusted party across this boundary: were its own `requires` the source of
+// the enforced requirement, a module declaring none would thereby become ungated and
+// under-declaring would be the escape hatch. So the division is the one `Minter` already
+// uses everywhere else — the module says what it DOES; the host says what it MAY DO. A
+// module's self-description is fine for the catalog and for display, never as the source of
+// an enforced requirement.
+//
+// The hole this closes: a prefix mount resolved every IRI under it to an endpoint whose card
+// carried no `requires` at all — `ModuleSpace`'s endpoint had no `describe()` override
+// whatsoever (so it answered the `Endpoint` trait default, which declares no verbs and
+// therefore no actions), and `WasmModuleSpace` fell back to the generic prefix card. Either
+// way omission failed OPEN: an endpoint declaring `.requires("urn:cap:demo:greet")` resolved
+// under a capability granting only `urn:cap:demo:read`, while the identical declaration on a
+// linked endpoint was correctly denied.
+//
+// A floor is a mount-time host declaration: the scopes every non-`Meta` verb under the mount
+// requires. A per-endpoint card (`with_endpoint`) REFINES it — it can add scopes, never
+// remove them — so absence of a card still gates, which is what keeps a prefix mount usable
+// (not enumerating endpoints is its whole point) without leaving it a hole. `ModuleFloor`
+// has no `Default` and every mount constructor takes one by value, so the ungated mount is
+// not reachable by omission: it has to be written down, `ModuleFloor::public()`.
+// ---------------------------------------------------------------------------
+
+/// The capability floor a host imposes on a module mount: the scopes every non-`Meta` verb
+/// under it requires, whatever the module says about itself.
+///
+/// Passed by value to [`ModuleSpace::new`] / [`ModuleSpace::connect`] /
+/// [`WasmModuleSpace::new`], so mounting a module is always an explicit authority decision:
+///
+/// ```
+/// use ikigai_module::ModuleFloor;
+///
+/// // Everything under this mount needs the module's own grant…
+/// let gated = ModuleFloor::requiring("urn:cap:xslt");
+/// // …or some grant under a parameterized family (the wildcard form the manifold uses).
+/// let net = ModuleFloor::requiring("urn:cap:net:*").and("urn:cap:xslt");
+/// // A module that genuinely needs no authority says so out loud.
+/// let open = ModuleFloor::public();
+/// assert!(open.scopes().is_empty());
+/// assert_eq!(net.scopes(), ["urn:cap:net:*", "urn:cap:xslt"]);
+/// # let _ = gated;
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleFloor {
+    /// Empty ⇔ [`public`](Self::public). Private, and the only zero-scope constructor is
+    /// `public()` — [`requiring`](Self::requiring) takes its first scope by value — so "no
+    /// floor" is a sentence a host can write but never one it can omit.
+    scopes: Vec<String>,
+}
+
+impl ModuleFloor {
+    /// The host asserts this mount needs no authority: endpoints under it are as public as a
+    /// public linked endpoint, and a module endpoint's own `requires` (which can only ever
+    /// deny *more*, see [`refuse_unsatisfied_declaration`]) is all that gates it.
+    ///
+    /// The deliberate, named form of the behavior this crate used to have by accident.
+    pub fn public() -> Self {
+        ModuleFloor { scopes: Vec::new() }
+    }
+
+    /// Every non-`Meta` verb under this mount requires `scope`. Chain
+    /// [`and`](Self::and) for more.
+    ///
+    /// Scopes are the same IRIs the manifold speaks, wildcard form included
+    /// (`urn:cap:net:*` = "holds some grant under this prefix").
+    pub fn requiring(scope: impl Into<String>) -> Self {
+        ModuleFloor {
+            scopes: vec![scope.into()],
+        }
+    }
+
+    /// Add another required scope (builder). All of them must be held.
+    pub fn and(mut self, scope: impl Into<String>) -> Self {
+        self.scopes.push(scope.into());
+        self
+    }
+
+    /// The scopes this floor demands — empty exactly for [`public`](Self::public).
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    /// The first floor scope `capability` does not hold, or `None` when the floor is met.
+    pub fn unsatisfied(&self, capability: &Capability) -> Option<&str> {
+        self.scopes
+            .iter()
+            .map(String::as_str)
+            .find(|scope| !cap_satisfies(capability, scope))
+    }
+
+    /// The floor folded into `card` — the manifold's half of `declared = enforced`, so what
+    /// a catalog offers under this mount is what the mount admits.
+    ///
+    /// Unioned into the flat `requires` (which every *synthesized* per-verb spec inherits)
+    /// **and** into each explicitly declared non-`Meta` action, because an explicit action
+    /// wins over the flat fields for its verb and would otherwise advertise — and be checked
+    /// against — a smaller requirement than the mount enforces.
+    ///
+    /// It never invents a verb. A card declaring none synthesizes no action specs, so the
+    /// kernel's pre-dispatch check finds nothing to enforce on it; that is precisely why the
+    /// floor is *also* checked at invoke, where no card is required for it to bite.
+    fn applied_to(&self, mut card: Description) -> Description {
+        if self.scopes.is_empty() {
+            return card;
+        }
+        for scope in &self.scopes {
+            if !card.requires.contains(scope) {
+                card.requires.push(scope.clone());
+            }
+        }
+        for action in card.actions.iter_mut().filter(|a| a.verb != Verb::Meta) {
+            for scope in &self.scopes {
+                if !action.requires.contains(scope) {
+                    action.requires.push(scope.clone());
+                }
+            }
+        }
+        card
+    }
+
+    /// The denial for an invocation that does not clear this floor. Says what to add,
+    /// because a denial alone does not tell an operator where the requirement lives.
+    fn denial(&self, scope: &str, target: &str) -> Error {
+        Error::Denied(format!(
+            "capability does not grant `{scope}` (the capability floor of the module mount \
+             serving `{target}`). Grant the scope, or mount the module with a floor the \
+             caller clears — `ModuleFloor::requiring(..)` at the mount, refined per endpoint \
+             with `with_endpoint(iri, Description::new(..).verb(..).requires(..))`."
+        ))
+    }
+}
+
+/// Whether `capability` satisfies a declared scope, wildcard form included.
+///
+/// ⚠ A mirror of `ikigai_core`'s `cap_satisfies`, which is `pub(crate)` there. The kernel's
+/// pre-dispatch floor, `urn:kernel:actions` and `urn:kernel:validate` agree because they
+/// share that one predicate; a host-side gate *outside* core cannot reach it, so this
+/// restates it. `capability_scopes_match_the_kernels_predicate` pins the four cases (root,
+/// exact, wildcard held, wildcard not held); if core ever exports the predicate, delete this
+/// and call it.
+fn cap_satisfies(capability: &Capability, scope: &str) -> bool {
+    match scope.strip_suffix('*') {
+        Some(prefix) => match capability.scopes() {
+            // Root holds every scope; `scopes()` is `None` exactly for root.
+            None => true,
+            Some(held) => held.iter().any(|s| s.starts_with(prefix)),
+        },
+        None => capability.allows(scope),
+    }
+}
+
+/// The first scope `description` declares for `verb` that `capability` lacks — this crate's
+/// mirror of the kernel's pre-dispatch floor check, for the module side of the boundary.
+///
+/// `Meta` is exempt exactly as it is in core (`action_specs()` carries no `Meta` spec), so a
+/// module endpoint's self-description stays readable wherever the catalog offers it.
+fn unsatisfied_scope(
+    description: &Description,
+    verb: Verb,
+    capability: &Capability,
+) -> Option<String> {
+    description
+        .action_specs()
+        .into_iter()
+        .filter(|spec| spec.verb == verb)
+        .flat_map(|spec| spec.requires)
+        .find(|scope| !cap_satisfies(capability, scope))
+}
+
+/// Refuse an invocation the module's OWN card says it lacks the authority for — the second
+/// guard beside [`refuse_undeclared_rewrite`], at every module-side dispatch site.
+///
+/// This is **not** the authoritative gate; [`ModuleFloor`] is, host-side, because the module
+/// is the untrusted party and authority must never be self-asserted by the thing being
+/// gated. This is the module *honoring its own declaration*, and it can only ever deny
+/// **more** than the floor already denies: a module that declares nothing is still gated by
+/// the mount, so under-declaring buys nothing. What it buys everyone else is that
+/// `.requires(..)` on a module endpoint stops being decoration — one declaration means the
+/// same thing whether that endpoint is linked or loaded.
+fn refuse_unsatisfied_declaration(
+    request: &Request,
+    resolved: &Resolved,
+    capability: &Capability,
+) -> Option<String> {
+    let scope = unsatisfied_scope(&resolved.endpoint.describe(), request.verb, capability)?;
+    Some(format!(
+        "capability does not grant `{scope}` (declared by `{target}`, inside the module)",
+        target = request.target.as_str(),
+    ))
 }
 
 /// What routing a target through a module's declared canonicalization decided.
@@ -576,6 +799,15 @@ impl ModuleTransport for InProcessTransport {
                 {
                     return Err(Error::Endpoint(message));
                 }
+                // The authority guard: the module's own card, honored by the module. The
+                // mount's `ModuleFloor` has already gated this host-side and is the
+                // authoritative floor; this can only ever deny more. See
+                // `refuse_unsatisfied_declaration`.
+                if let Some(message) =
+                    refuse_unsatisfied_declaration(&request, &resolved, capability)
+                {
+                    return Err(Error::Denied(message));
+                }
                 // Run the module's endpoint with the HOST as its issuer: its
                 // `inv.source(..)` calls cross back to the host kernel.
                 let inv = Invocation::with_issuer(&request, &resolved.bindings, capability, host);
@@ -800,6 +1032,14 @@ async fn run_module_session(
             Resolution::Hit(resolved) => {
                 if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, &rewrite) {
                     ModuleReply::Error(message)
+                } else if let Some(message) =
+                    refuse_unsatisfied_declaration(&request, &resolved, &capability)
+                {
+                    // The module honoring its own card; the mount's floor already gated this
+                    // host-side. ⚠ `ModuleReply::Error` carries no error TYPE, so this
+                    // arrives at the host as `Error::Endpoint`, not `Error::Denied` — see
+                    // the note on `ModuleReply::Error`.
+                    ModuleReply::Error(message)
                 } else {
                     // The issuer now owns the receiver: after `Invoke`, every inbound
                     // message is a `HostResult` answering one of its `HostCall`s.
@@ -930,6 +1170,10 @@ where
         }) => match space.resolve(&request, &Scope::empty()) {
             Resolution::Hit(resolved) => {
                 if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, rewrite) {
+                    ModuleReply::Error(message)
+                } else if let Some(message) =
+                    refuse_unsatisfied_declaration(&request, &resolved, &capability)
+                {
                     ModuleReply::Error(message)
                 } else {
                     let issuer = ClosureHostIssuer {
@@ -1124,6 +1368,9 @@ pub struct WasmModuleSpace {
     /// asked before it is loaded — and loading it to ask would defeat the laziness — so
     /// this arrives as static host data, like the endpoint cards beside it.
     aliases: ModuleAliases,
+    /// The host's authority declaration for this mount — see [`ModuleFloor`]. Folded into
+    /// every card `card_for` hands out and enforced before anything crosses the boundary.
+    floor: ModuleFloor,
 }
 
 impl WasmModuleSpace {
@@ -1131,10 +1378,15 @@ impl WasmModuleSpace {
     /// module endpoint's self-description (for `Meta` / the catalog). With no enumerated
     /// endpoints (see [`with_endpoint`](Self::with_endpoint)) the space does not list in
     /// the catalog — it only resolves by prefix.
+    ///
+    /// `floor` is the host's authority declaration for the whole mount ([`ModuleFloor`]) —
+    /// by value, so mounting a module is always an explicit decision and the ungated mount
+    /// cannot be reached by omission. A per-endpoint card refines it; it never lowers it.
     pub fn new(
         prefixes: impl IntoIterator<Item = impl Into<String>>,
         transport: Arc<dyn ModuleSessionTransport>,
         describe: Description,
+        floor: ModuleFloor,
     ) -> Self {
         Self {
             prefixes: prefixes.into_iter().map(Into::into).collect(),
@@ -1142,6 +1394,7 @@ impl WasmModuleSpace {
             describe,
             endpoints: Vec::new(),
             aliases: ModuleAliases::unknown(),
+            floor,
         }
     }
 
@@ -1175,13 +1428,18 @@ impl WasmModuleSpace {
     }
 
     /// The card to hand the resolved endpoint for `target`: the enumerated endpoint's own
-    /// description if `target` is one, else the generic prefix card.
+    /// description if `target` is one, else the generic prefix card — **always with the
+    /// mount's floor folded in**. The fallback is what used to make an undeclared IRI under
+    /// the prefix *less* gated than a declared one; it cannot any more, because the floor
+    /// applies to both arms.
     fn card_for(&self, target: &str) -> Description {
-        self.endpoints
+        let card = self
+            .endpoints
             .iter()
             .find(|(iri, _)| iri == target)
             .map(|(_, d)| d.clone())
-            .unwrap_or_else(|| self.describe.clone())
+            .unwrap_or_else(|| self.describe.clone());
+        self.floor.applied_to(card)
     }
 }
 
@@ -1208,6 +1466,7 @@ impl Space for WasmModuleSpace {
             endpoint: Arc::new(WasmModuleEndpoint {
                 transport: Arc::clone(&self.transport),
                 describe: self.card_for(target),
+                floor: self.floor.clone(),
             }),
             bindings: Bindings::new(),
             canonical,
@@ -1239,11 +1498,15 @@ impl Space for WasmModuleSpace {
 struct WasmModuleEndpoint {
     transport: Arc<dyn ModuleSessionTransport>,
     describe: Description,
+    floor: ModuleFloor,
 }
 
 #[async_trait]
 impl Endpoint for WasmModuleEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if let Some(scope) = self.floor.unsatisfied(inv.capability) {
+            return Err(self.floor.denial(scope, inv.request.target.as_str()));
+        }
         let invoke = encode(&ModuleCall::Invoke {
             request: inv.request.clone(),
             capability: inv.capability.clone(),
@@ -1618,6 +1881,11 @@ mod uds {
                 if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, rewrite) {
                     return ModuleReply::Error(message);
                 }
+                if let Some(message) =
+                    refuse_unsatisfied_declaration(&request, &resolved, &capability)
+                {
+                    return ModuleReply::Error(message);
+                }
                 let issuer = SocketHostIssuer { stream };
                 let inv =
                     Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
@@ -1672,7 +1940,11 @@ mod uds {
 /// ```ignore
 /// Fallback::new(vec![
 ///     Arc::new(local_space),
-///     Arc::new(ModuleSpace::new(["urn:xslt:"], Arc::new(InProcessTransport::new(ikigai_xslt::space())))),
+///     Arc::new(ModuleSpace::new(
+///         ["urn:xslt:"],
+///         Arc::new(InProcessTransport::new(ikigai_xslt::space())),
+///         ModuleFloor::requiring("urn:cap:xslt"),   // ← what this mount may do
+///     )),
 ///     // …
 /// ])
 /// ```
@@ -1680,6 +1952,13 @@ pub struct ModuleSpace {
     prefixes: Vec<String>,
     transport: Arc<dyn ModuleTransport>,
     aliases: ModuleAliases,
+    /// The host's authority declaration for this mount — see [`ModuleFloor`].
+    floor: ModuleFloor,
+    /// Concrete endpoint IRIs the host declares a card for, so `Meta` under this mount
+    /// answers something better than "module" and a *refinement* of the floor has somewhere
+    /// to live. Host data, exactly as in [`WasmModuleSpace`]: the module's own card is fine
+    /// for the catalog, never as the source of an enforced requirement.
+    endpoints: Vec<(String, Description)>,
 }
 
 impl ModuleSpace {
@@ -1692,14 +1971,20 @@ impl ModuleSpace {
     /// [`ModuleRewrite::Unknown`], so the host shares no identity with the module and the
     /// module side refuses any invocation whose resolution reports a rewrite (see
     /// [`ModuleRewrite`]).
+    /// `floor` is the host's authority declaration for the whole mount ([`ModuleFloor`]),
+    /// taken by value so the ungated mount cannot be reached by omission — it must be
+    /// written, `ModuleFloor::public()`.
     pub fn new(
         prefixes: impl IntoIterator<Item = impl Into<String>>,
         transport: Arc<dyn ModuleTransport>,
+        floor: ModuleFloor,
     ) -> Self {
         Self {
             prefixes: prefixes.into_iter().map(Into::into).collect(),
             transport,
             aliases: ModuleAliases::unknown(),
+            floor,
+            endpoints: Vec::new(),
         }
     }
 
@@ -1714,9 +1999,12 @@ impl ModuleSpace {
     ///
     /// Errors if the module's declared table is unparseable or names anything outside
     /// `prefixes` — at mount time, where an operator is watching.
+    /// The module is asked how it NAMES things; it is never asked what it may DO — `floor`
+    /// is the host's ([`ModuleFloor`]).
     pub async fn connect(
         prefixes: impl IntoIterator<Item = impl Into<String>>,
         transport: Arc<dyn ModuleTransport>,
+        floor: ModuleFloor,
     ) -> Result<Self> {
         let prefixes: Vec<String> = prefixes.into_iter().map(Into::into).collect();
         let manifest = transport.manifest().await?;
@@ -1725,6 +2013,8 @@ impl ModuleSpace {
             prefixes,
             transport,
             aliases,
+            floor,
+            endpoints: Vec::new(),
         })
     }
 
@@ -1742,9 +2032,40 @@ impl ModuleSpace {
         self
     }
 
+    /// Declare a concrete endpoint IRI and the card the host stands behind for it: what it
+    /// answers `Meta` with, and — the point — the place a *refinement* of the mount's
+    /// [`ModuleFloor`] is written (`Description::new(..).verb(..).requires(..)`). Builder
+    /// style; call once per endpoint.
+    ///
+    /// A card can only ADD to the floor: [`ModuleFloor::applied_to`] folds the mount's
+    /// scopes into every card, so an IRI with no card is gated exactly as strictly as one
+    /// with, and forgetting a card can never buy less gating.
+    pub fn with_endpoint(mut self, iri: impl Into<String>, describe: Description) -> Self {
+        self.endpoints.push((iri.into(), describe));
+        self
+    }
+
+    /// The card to hand the resolved endpoint for `target`, with the mount's floor folded
+    /// in. Falls back to the bare `"module"` card for an IRI the host declared nothing for —
+    /// which is a *display* fallback only, never an authority one.
+    fn card_for(&self, target: &str) -> Description {
+        let card = self
+            .endpoints
+            .iter()
+            .find(|(iri, _)| iri == target)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_else(|| Description::new("module"));
+        self.floor.applied_to(card)
+    }
+
     /// What the module said about how it names things.
     pub fn rewrite(&self) -> &ModuleRewrite {
         &self.aliases.rewrite
+    }
+
+    /// The authority floor this mount imposes.
+    pub fn floor(&self) -> &ModuleFloor {
+        &self.floor
     }
 }
 
@@ -1771,6 +2092,8 @@ impl Space for ModuleSpace {
         Resolution::Hit(Resolved {
             endpoint: Arc::new(ModuleEndpoint {
                 transport: Arc::clone(&self.transport),
+                describe: self.card_for(target),
+                floor: self.floor.clone(),
             }),
             bindings: Bindings::new(),
             canonical,
@@ -1788,11 +2111,24 @@ impl Space for ModuleSpace {
 /// serves the callbacks from its cache (cacheability composes across the boundary).
 struct ModuleEndpoint {
     transport: Arc<dyn ModuleTransport>,
+    describe: Description,
+    floor: ModuleFloor,
 }
 
 #[async_trait]
 impl Endpoint for ModuleEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // ★ The mount's capability floor, host-side, before anything crosses the boundary.
+        // The kernel's own pre-dispatch check (`declared = enforced`) already holds it for
+        // every verb this endpoint's card DECLARES; this holds it for the rest — a prefix
+        // mount whose IRI has no card declares no verbs, synthesizes no action specs, and
+        // was therefore checked against nothing at all. That gap is how a declared
+        // requirement used to reach an ungated invocation. `Meta` never arrives here: the
+        // kernel renders `describe()` without invoking, which is the same exemption core
+        // makes by leaving `Meta` out of `action_specs()`.
+        if let Some(scope) = self.floor.unsatisfied(inv.capability) {
+            return Err(self.floor.denial(scope, inv.request.target.as_str()));
+        }
         let bridge = HostBridge { inv };
         self.transport
             .invoke(inv.request.clone(), inv.capability, &bridge)
@@ -1801,6 +2137,10 @@ impl Endpoint for ModuleEndpoint {
 
     fn name(&self) -> &str {
         "module"
+    }
+
+    fn describe(&self) -> Description {
+        self.describe.clone()
     }
 }
 
@@ -1827,8 +2167,8 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{
-        Alias, ArgRef, ArgSpec, Description, EndpointSpace, Exact, Fallback, Kernel, MetaRenderer,
-        ReprType, Rewrite, Verb,
+        ActionSpec, Alias, ArgRef, ArgSpec, Description, EndpointSpace, Exact, Fallback, Kernel,
+        MetaRenderer, ReprType, Rewrite, Verb,
     };
     use std::sync::Mutex;
 
@@ -1938,6 +2278,7 @@ mod tests {
         let module = ModuleSpace::new(
             ["urn:stub:"],
             Arc::new(InProcessTransport::new(stub_module())),
+            ModuleFloor::public(),
         );
 
         let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
@@ -1972,6 +2313,7 @@ mod tests {
         let module = ModuleSpace::new(
             ["urn:stub:"],
             Arc::new(InProcessTransport::new(stub_module())),
+            ModuleFloor::public(),
         );
         let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
             Arc::new(host_space) as Arc<dyn Space>,
@@ -2014,6 +2356,7 @@ mod tests {
         let module = ModuleSpace::new(
             ["urn:stub:"],
             Arc::new(transport) as Arc<dyn ModuleTransport>,
+            ModuleFloor::public(),
         );
         Arc::new(Fallback::new(vec![
             Arc::new(host_space) as Arc<dyn Space>,
@@ -2202,7 +2545,12 @@ mod tests {
         });
         let describe = Description::new("stub-concat").title("Concat (test stub)");
         let kernel = Kernel::with_meta_renderer(
-            Arc::new(WasmModuleSpace::new(["urn:stub:"], transport, describe)) as Arc<dyn Space>,
+            Arc::new(WasmModuleSpace::new(
+                ["urn:stub:"],
+                transport,
+                describe,
+                ModuleFloor::public(),
+            )) as Arc<dyn Space>,
             Arc::new(PlainRenderer),
         );
 
@@ -2233,6 +2581,7 @@ mod tests {
             ["urn:jsonld:"],
             Arc::new(NeverTransport),
             Description::new("jsonld"),
+            ModuleFloor::public(),
         )
         .with_endpoint(
             "urn:jsonld:expand",
@@ -2283,6 +2632,7 @@ mod tests {
             ["urn:stub:"],
             Arc::new(NeverTransport),
             Description::new("stub"),
+            ModuleFloor::public(),
         );
         assert!(space.entries().is_none());
     }
@@ -2322,8 +2672,12 @@ mod tests {
         }
 
         let transport = Arc::new(crate::uds::UdsTransport::connect(&path));
-        let module = block_on(ModuleSpace::connect(["urn:stub:"], transport))
-            .expect("mount the socket-served module");
+        let module = block_on(ModuleSpace::connect(
+            ["urn:stub:"],
+            transport,
+            ModuleFloor::public(),
+        ))
+        .expect("mount the socket-served module");
         assert_eq!(module.rewrite(), &ModuleRewrite::from_table(&table));
         assert_one_identity_across_the_boundary(&kernel_with(module));
         let _ = std::fs::remove_file(&path);
@@ -2361,6 +2715,7 @@ mod tests {
         let module = ModuleSpace::new(
             ["urn:stub:"],
             Arc::new(crate::uds::UdsTransport::connect(&path)),
+            ModuleFloor::public(),
         );
         let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
             Arc::new(host_space) as Arc<dyn Space>,
@@ -2459,7 +2814,12 @@ mod tests {
 
     /// Mount a module that aliases, declaring the table it aliases through.
     fn declared_module(transport: Arc<dyn ModuleTransport>) -> ModuleSpace {
-        block_on(ModuleSpace::connect(["urn:stub:"], transport)).expect("connect to the module")
+        block_on(ModuleSpace::connect(
+            ["urn:stub:"],
+            transport,
+            ModuleFloor::public(),
+        ))
+        .expect("connect to the module")
     }
 
     /// The acceptance assertions, run against whichever transport carried the declaration.
@@ -2601,7 +2961,11 @@ mod tests {
 
     /// Mount an aliasing module WITHOUT telling the host, and try the logical name.
     fn undeclared_error(transport: Arc<dyn ModuleTransport>) -> String {
-        let kernel = kernel_with(ModuleSpace::new(["urn:stub:"], transport));
+        let kernel = kernel_with(ModuleSpace::new(
+            ["urn:stub:"],
+            transport,
+            ModuleFloor::public(),
+        ));
         let err = block_on(kernel.issue(join_request(), &Capability::root()))
             .expect_err("an undeclared rewrite must not be served");
         assert!(
@@ -2709,7 +3073,7 @@ mod tests {
         // a rule pointing outside the namespace the host routed to this module is a claim
         // on a name the module was never given.
         let transport = Arc::new(InProcessTransport::new(stub_module()));
-        let err = ModuleSpace::new(["urn:stub:"], transport)
+        let err = ModuleSpace::new(["urn:stub:"], transport, ModuleFloor::public())
             .declaring(ModuleRewrite::Table(
                 "exact urn:stub:join urn:test:greeting\n".to_string(),
             ))
@@ -2721,12 +3085,16 @@ mod tests {
     #[test]
     fn a_rewrite_naming_the_kernel_namespace_is_refused_at_mount_time() {
         let transport = Arc::new(InProcessTransport::new(stub_module()));
-        let err = ModuleSpace::new(["urn:stub:", "urn:kernel:"], transport)
-            .declaring(ModuleRewrite::Table(
-                "exact urn:stub:join urn:kernel:cut\n".to_string(),
-            ))
-            .map(|_| ())
-            .expect_err("the reserved namespace is not aliasable");
+        let err = ModuleSpace::new(
+            ["urn:stub:", "urn:kernel:"],
+            transport,
+            ModuleFloor::public(),
+        )
+        .declaring(ModuleRewrite::Table(
+            "exact urn:stub:join urn:kernel:cut\n".to_string(),
+        ))
+        .map(|_| ())
+        .expect_err("the reserved namespace is not aliasable");
         assert!(
             err.to_string().contains("reserved kernel namespace"),
             "{err}"
@@ -2736,7 +3104,7 @@ mod tests {
     #[test]
     fn an_unparseable_declared_table_is_refused_at_mount_time() {
         let transport = Arc::new(InProcessTransport::new(stub_module()));
-        let err = ModuleSpace::new(["urn:stub:"], transport)
+        let err = ModuleSpace::new(["urn:stub:"], transport, ModuleFloor::public())
             .declaring(ModuleRewrite::Table("wobble urn:stub:join\n".to_string()))
             .map(|_| ())
             .expect_err("a malformed table fails when it is read");
@@ -2794,8 +3162,315 @@ mod tests {
         let manifest = block_on(BareTransport.manifest()).unwrap();
         assert_eq!(manifest.rewrite, ModuleRewrite::Unknown);
         assert!(!manifest.rewrite.is_declared());
-        let module = block_on(ModuleSpace::connect(["urn:stub:"], Arc::new(BareTransport)))
-            .expect("mounting an unasked module still works");
+        let module = block_on(ModuleSpace::connect(
+            ["urn:stub:"],
+            Arc::new(BareTransport),
+            ModuleFloor::public(),
+        ))
+        .expect("mounting an unasked module still works");
         assert_eq!(module.rewrite(), &ModuleRewrite::Unknown);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Capability enforcement across the module boundary.
+    //
+    // The defect these pin: an endpoint declaring `.requires("urn:cap:demo:greet")`, reached
+    // through a `ModuleSpace`, used to RESOLVE under a capability granting only
+    // `urn:cap:demo:read` — while the identical declaration on a *linked* endpoint was
+    // correctly denied. Two halves to the fix, and both are tested here:
+    //
+    //   * the mount's `ModuleFloor` — the HOST's authority declaration, which is the
+    //     authoritative gate precisely because the module cannot lower it; and
+    //   * the module honoring its OWN card, which can only ever deny more.
+    //
+    // The pair matters: without the positive case a test suite passes by denying
+    // everything, and without the floor a module declaring nothing would be ungated.
+    // -----------------------------------------------------------------------------------
+
+    /// The scope the gated stub declares, and one that is not it.
+    const GREET: &str = "urn:cap:demo:greet";
+    const READ: &str = "urn:cap:demo:read";
+
+    /// A module endpoint that DECLARES an authority requirement and takes no arguments —
+    /// the smallest thing that can be resolved identically linked and loaded.
+    struct GreetEndpoint;
+
+    #[async_trait]
+    impl Endpoint for GreetEndpoint {
+        async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"greetings".to_vec(),
+            ))
+        }
+
+        fn name(&self) -> &str {
+            "stub-greet"
+        }
+
+        fn describe(&self) -> Description {
+            Description::new("stub-greet")
+                .title("Greet (gated test stub)")
+                .verb(Verb::Source)
+                .requires(GREET)
+                .output("text/plain")
+        }
+    }
+
+    fn gated_module() -> EndpointSpace {
+        EndpointSpace::new().bind(Exact::new("urn:stub:greet"), GreetEndpoint)
+    }
+
+    fn greet_request() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:stub:greet").unwrap())
+    }
+
+    fn kernel_over(space: impl Space + 'static) -> Kernel {
+        Kernel::with_meta_renderer(Arc::new(space) as Arc<dyn Space>, Arc::new(PlainRenderer))
+    }
+
+    #[test]
+    fn a_module_endpoints_declared_requirement_is_enforced_like_a_linked_ones() {
+        // THE REPRODUCTION. Same endpoint, same declaration, same capability — once bound
+        // straight into the host's space, once reached only through a module mount. The two
+        // paths must agree, in both directions.
+        let linked = kernel_over(gated_module());
+        let loaded = kernel_over(ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(InProcessTransport::new(gated_module())),
+            // Deliberately `public()`: this isolates the module's own declaration. The
+            // mount adds nothing, so anything that denies here is the module honoring its
+            // card — which is what used to be ignored entirely.
+            ModuleFloor::public(),
+        ));
+
+        let wrong = Capability::scoped([READ]);
+        let linked_denial = block_on(linked.issue(greet_request(), &wrong))
+            .expect_err("a linked endpoint's declaration is enforced by the kernel");
+        let loaded_denial = block_on(loaded.issue(greet_request(), &wrong))
+            .expect_err("a module endpoint's declaration must be enforced too");
+        assert!(
+            matches!(linked_denial, Error::Denied(_)),
+            "{linked_denial:?}"
+        );
+        assert!(
+            matches!(loaded_denial, Error::Denied(_)),
+            "{loaded_denial:?}"
+        );
+        assert!(loaded_denial.to_string().contains(GREET), "{loaded_denial}");
+
+        // The other direction, or the suite would pass by denying everything.
+        let right = Capability::scoped([GREET]);
+        assert_eq!(
+            block_on(linked.issue(greet_request(), &right))
+                .expect("granted, linked")
+                .bytes,
+            b"greetings".to_vec()
+        );
+        assert_eq!(
+            block_on(loaded.issue(greet_request(), &right))
+                .expect("granted, loaded")
+                .bytes,
+            b"greetings".to_vec()
+        );
+    }
+
+    #[test]
+    fn the_serialized_session_enforces_the_declaration_too() {
+        // Through the codec, so the guard is not an artifact of the direct-call transport.
+        // ⚠ The refusal arrives as `Error::Endpoint`, not `Error::Denied`: `ModuleReply::Error`
+        // carries a string, so the error TYPE does not survive the wire. Pinned rather than
+        // wished away — it is a real gap in the module protocol.
+        let kernel = kernel_over(ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(LoopbackTransport::new(gated_module())),
+            ModuleFloor::public(),
+        ));
+        let denial = block_on(kernel.issue(greet_request(), &Capability::scoped([READ])))
+            .expect_err("the module's declaration is enforced over the session too");
+        assert!(denial.to_string().contains(GREET), "{denial}");
+        assert_eq!(
+            block_on(kernel.issue(greet_request(), &Capability::scoped([GREET])))
+                .expect("granted, over the session")
+                .bytes,
+            b"greetings".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_module_that_declares_nothing_does_not_thereby_become_ungated() {
+        // ★ The trust direction. `stub_module`'s `urn:stub:whoami` declares no requirement
+        // at all — under the old code that meant "ungated", which made UNDER-DECLARING the
+        // escape hatch. The mount's floor is the host's word, and the module has no way to
+        // lower it.
+        const MOUNT: &str = "urn:cap:module:stub";
+        let kernel = kernel_over(ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(InProcessTransport::new(stub_module())),
+            ModuleFloor::requiring(MOUNT),
+        ));
+        let whoami = || Request::new(Verb::Source, Iri::parse("urn:stub:whoami").unwrap());
+
+        let denial = block_on(kernel.issue(whoami(), &Capability::scoped([READ])))
+            .expect_err("the mount's floor gates an endpoint that declares nothing");
+        assert!(matches!(denial, Error::Denied(_)), "{denial:?}");
+        assert!(denial.to_string().contains(MOUNT), "{denial}");
+        // The denial has to say what to add — it is not guessable from a refusal.
+        assert!(
+            denial.to_string().contains("ModuleFloor::requiring"),
+            "{denial}"
+        );
+
+        assert!(block_on(kernel.issue(whoami(), &Capability::scoped([MOUNT]))).is_ok());
+    }
+
+    #[test]
+    fn an_iri_with_no_host_card_is_gated_exactly_as_one_with() {
+        // `card_for`'s fallback was the hole: an IRI the host never enumerated took the
+        // generic prefix card, which carried no `requires`, so *forgetting* a card bought
+        // LESS gating than declaring one. The floor applies to both arms now.
+        const MOUNT: &str = "urn:cap:module:stub";
+        let kernel = kernel_over(
+            ModuleSpace::new(
+                ["urn:stub:"],
+                Arc::new(InProcessTransport::new(stub_module())),
+                ModuleFloor::requiring(MOUNT),
+            )
+            // Declared: this one has a card. `urn:stub:whoami` deliberately does not.
+            .with_endpoint(
+                "urn:stub:concat",
+                Description::new("stub-concat").verb(Verb::Source),
+            ),
+        );
+        let unrelated = Capability::scoped([READ]);
+        for target in ["urn:stub:concat", "urn:stub:whoami"] {
+            let request = Request::new(Verb::Source, Iri::parse(target).unwrap());
+            let denial = block_on(kernel.issue(request, &unrelated))
+                .expect_err("every IRI under the mount is gated by the floor")
+                .to_string();
+            assert!(denial.contains(MOUNT), "{target}: {denial}");
+        }
+    }
+
+    #[test]
+    fn the_floor_rides_in_the_card_the_kernel_enforces() {
+        // The manifold's half of `declared = enforced`: what a catalog offers under this
+        // mount is what the mount admits. Folded into the flat `requires` AND into an
+        // explicitly declared action, since an explicit action wins for its verb and would
+        // otherwise advertise a smaller requirement than the mount enforces.
+        const MOUNT: &str = "urn:cap:module:stub";
+        let space = ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(InProcessTransport::new(stub_module())),
+            ModuleFloor::requiring(MOUNT),
+        )
+        .with_endpoint(
+            "urn:stub:concat",
+            Description::new("stub-concat")
+                .verb(Verb::Source)
+                // A card may only ADD to the floor.
+                .requires(READ)
+                .action(ActionSpec::new(Verb::Sink).requires(GREET)),
+        );
+
+        let card = card_of(&space, "urn:stub:concat");
+        assert!(card.requires.contains(&MOUNT.to_string()), "{card:?}");
+        assert!(card.requires.contains(&READ.to_string()), "{card:?}");
+        let sink = card
+            .action_specs()
+            .into_iter()
+            .find(|a| a.verb == Verb::Sink)
+            .expect("the declared Sink action");
+        assert!(sink.requires.contains(&MOUNT.to_string()), "{sink:?}");
+        assert!(sink.requires.contains(&GREET.to_string()), "{sink:?}");
+
+        // …and the undeclared IRI's fallback card carries the floor too.
+        let fallback = card_of(&space, "urn:stub:whoami");
+        assert_eq!(fallback.requires, vec![MOUNT.to_string()]);
+    }
+
+    /// The card a space hands the kernel for `target` (what `unsatisfied_scope` reads).
+    fn card_of(space: &dyn Space, target: &str) -> Description {
+        let request = Request::new(Verb::Source, Iri::parse(target).unwrap());
+        let Resolution::Hit(resolved) = space.resolve(&request, &Scope::empty()) else {
+            panic!("{target} should resolve under the mount");
+        };
+        resolved.endpoint.describe()
+    }
+
+    #[test]
+    fn meta_stays_readable_under_a_floor_the_caller_cannot_clear() {
+        // Core exempts `Meta` by construction (`action_specs()` carries no Meta spec) and the
+        // kernel renders `describe()` without invoking, so the floor's invoke-time check
+        // never sees a Meta request either. Self-description stays readable wherever the
+        // catalog offers it — pinned, because a floor that hid the manifold would make the
+        // system unnavigable exactly when an agent needs to learn what it may ask for.
+        let kernel = kernel_over(ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(InProcessTransport::new(stub_module())),
+            ModuleFloor::requiring("urn:cap:module:stub"),
+        ));
+        let meta = Request::new(Verb::Meta, Iri::parse("urn:stub:whoami").unwrap());
+        assert!(block_on(kernel.issue(meta, &Capability::scoped([READ]))).is_ok());
+    }
+
+    #[test]
+    fn a_wasm_mounts_generic_card_is_gated_as_well() {
+        // The same fallback, on the browser space. Its generic card is host-supplied, so it
+        // LOOKS authored — but a prefix mount serves an open IRI set and only the floor
+        // reaches the ones nobody enumerated.
+        struct NeverTransport;
+        #[async_trait]
+        impl ModuleSessionTransport for NeverTransport {
+            async fn invoke_session(
+                &self,
+                _invoke: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, String> {
+                panic!("the floor must refuse before anything crosses the boundary");
+            }
+        }
+        const MOUNT: &str = "urn:cap:xslt";
+        let kernel = kernel_over(WasmModuleSpace::new(
+            ["urn:xslt:"],
+            Arc::new(NeverTransport),
+            Description::new("xslt").verb(Verb::Source),
+            ModuleFloor::requiring(MOUNT),
+        ));
+        let request = Request::new(Verb::Source, Iri::parse("urn:xslt:anything").unwrap());
+        let denial = block_on(kernel.issue(request, &Capability::scoped([READ])))
+            .expect_err("the floor gates an un-enumerated IRI under the prefix");
+        assert!(matches!(denial, Error::Denied(_)), "{denial:?}");
+        assert!(denial.to_string().contains(MOUNT), "{denial}");
+    }
+
+    #[test]
+    fn capability_scopes_match_the_kernels_predicate() {
+        // `cap_satisfies` is a restatement of core's `pub(crate)` predicate; if the two ever
+        // disagree, the manifold offers what the mount refuses (or worse, the reverse).
+        // Root, exact, wildcard-held, wildcard-not-held — the four cases core's has.
+        assert!(cap_satisfies(&Capability::root(), "urn:cap:anything"));
+        assert!(cap_satisfies(&Capability::root(), "urn:cap:net:*"));
+        let held = Capability::scoped(["urn:cap:net:example.com"]);
+        assert!(cap_satisfies(&held, "urn:cap:net:*"));
+        assert!(cap_satisfies(&held, "urn:cap:net:example.com"));
+        assert!(!cap_satisfies(&held, "urn:cap:net:other.com"));
+        assert!(!cap_satisfies(&held, "urn:cap:fs:*"));
+    }
+
+    #[test]
+    fn a_public_floor_is_a_sentence_the_host_writes_not_one_it_omits() {
+        // The ungated mount still exists — some modules genuinely need no authority — but it
+        // is now `ModuleFloor::public()`, by value, at every mount constructor. There is no
+        // `Default`, so it cannot be reached by forgetting.
+        assert!(ModuleFloor::public().scopes().is_empty());
+        assert!(ModuleFloor::public()
+            .unsatisfied(&Capability::scoped([READ]))
+            .is_none());
+        let floor = ModuleFloor::requiring("urn:cap:a").and("urn:cap:b");
+        assert_eq!(
+            floor.unsatisfied(&Capability::scoped(["urn:cap:a"])),
+            Some("urn:cap:b")
+        );
+        assert_eq!(floor.unsatisfied(&Capability::root()), None);
     }
 }

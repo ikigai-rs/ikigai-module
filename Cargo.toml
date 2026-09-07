@@ -1,6 +1,13 @@
 [package]
 name = "ikigai-module"
-version = "0.1.10"
+# 0.2.0, not 0.1.11: cargo treats 0.1.x as one compatible range, and this is a BREAKING
+# change in both directions. Source-breaking — `ModuleSpace::new`, `ModuleSpace::connect` and
+# `WasmModuleSpace::new` each take a `ModuleFloor` by value, so every mount site must state
+# what the module may do (the compile error IS the review trigger; a floor that could be
+# omitted would be the hole this closes). Behavior-breaking — a module endpoint's declared
+# `requires` is now ENFORCED across the boundary, so a caller that used to reach an
+# under-capability'd module endpoint is now correctly denied.
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
