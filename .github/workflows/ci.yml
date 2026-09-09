@@ -1,34 +1,12 @@
-# CI for ikigai-module. Published crate providing WasmModuleSpace / the
-# wasm_module! macro — linked natively by hosts AND compiled into their wasm
-# builds (it's deliberately "wasm-clean"). Had no CI, so check both faces so a
-# regression can't ride into the publish cascade or break a host's wasm build.
 name: ci
-
 on:
+  push: { branches: [main] }
   pull_request:
-  push:
-    branches: [main]
-
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel main
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-
-      - name: fmt
-        run: cargo fmt --all -- --check
-
-      - name: clippy (native, all targets)
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: test
-        run: cargo test
-
-      # Stays wasm-clean: hosts compile this into their browser builds.
-      - name: clippy (wasm lib)
-        run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
+  ci:
+    uses: ikigai-rs/.github/.github/workflows/rust.yml@main
+    with:
+      wasm-lib: true
