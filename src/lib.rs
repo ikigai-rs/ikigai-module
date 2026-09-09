@@ -428,7 +428,7 @@ pub struct ModuleFloor {
 impl ModuleFloor {
     /// The host asserts this mount needs no authority: endpoints under it are as public as a
     /// public linked endpoint, and a module endpoint's own `requires` (which can only ever
-    /// deny *more*, see [`refuse_unsatisfied_declaration`]) is all that gates it.
+    /// deny *more*, see `refuse_unsatisfied_declaration`, crate-private) is all that gates it.
     ///
     /// The deliberate, named form of the behavior this crate used to have by accident.
     pub fn public() -> Self {
@@ -857,7 +857,7 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 /// A [`ModuleTransport`] that runs the `ModuleCall`/`ModuleReply` session over a pair of
-/// in-memory byte channels, serializing every message with [`encode`]/[`decode`]. Same
+/// in-memory byte channels, serializing every message with the private `encode`/`decode`. Same
 /// protocol and bytes as a real (socket/wasm) transport, both ends in-process — so it
 /// proves the session without any I/O risk.
 ///
@@ -2037,7 +2037,7 @@ impl ModuleSpace {
     /// [`ModuleFloor`] is written (`Description::new(..).verb(..).requires(..)`). Builder
     /// style; call once per endpoint.
     ///
-    /// A card can only ADD to the floor: [`ModuleFloor::applied_to`] folds the mount's
+    /// A card can only ADD to the floor: `ModuleFloor::applied_to` (private) folds the mount's
     /// scopes into every card, so an IRI with no card is gated exactly as strictly as one
     /// with, and forgetting a card can never buy less gating.
     pub fn with_endpoint(mut self, iri: impl Into<String>, describe: Description) -> Self {
