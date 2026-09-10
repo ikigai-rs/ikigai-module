@@ -29,6 +29,8 @@ module's result is cached and invalidated exactly as a statically-linked space w
 | `WasmModuleSpace` / `wasm_module!` | both | The lazy browser module: one macro line emits the artifact's glue, one `WasmModuleSpace` binds it host-side. |
 | `ModuleRewrite` / `ModuleManifest` | wire | How the module **names** things — what lets it compose a rewriting space (see below). |
 | `ModuleFloor` | host | What the mount **may do** — the capability floor every non-`Meta` verb under it requires. The host's word, not the module's (see below). |
+| `ModuleError` | wire | The error taxonomy on the module wire — a mirror of `ikigai_core::Error`, so a failure keeps its **type** across the boundary in both directions (see below). |
+| `ModuleCard` | wire | One binding and the card its endpoint answers `Meta` with — what `ModuleSpace::connect` asks for, so the module's endpoints describe themselves through the mount. |
 
 ## Why a session, not a round-trip
 
@@ -62,6 +64,12 @@ The module's endpoints can now resolve `urn:xslt:` IRIs, and any `inv.source(..)
 make crosses back through the host kernel — so a module endpoint that joins two
 host-resolved resources inherits both of their golden threads, and the host caches the
 combined result. (See the crate's tests for that end-to-end.)
+
+Prefer `ModuleSpace::connect` over `new` when the transport can be asked: it fetches the
+module's cards at mount time, so `urn:kernel:catalog`, `urn:kernel:actions` and every `Meta`
+under the mount answer with the module's own self-description. A mount made with `new`
+describes an IRI the host declared nothing for with its generic card (`describing(..)` sets
+it), which the manifold cannot select — the documented cost of not asking.
 
 ## The module says what it does; the host says what it may do
 
@@ -103,12 +111,63 @@ Three properties, all of them the point:
 
 Beside the floor, the module also **honors its own card**: a module-side endpoint declaring
 `requires` is checked against the caller's capability at every dispatch site, over every
-transport. That can only ever deny *more* than the floor already denies, so it is safe to
-trust — and it means one `.requires(..)` declaration means the same thing whether an
-endpoint is linked or loaded.
+transport — and once `connect` has installed the module's cards, by the kernel itself,
+host-side, before anything crosses. That can only ever deny *more* than the floor already
+denies, so it is safe to trust — and it means one `.requires(..)` declaration means the same
+thing whether an endpoint is linked or loaded. A module's card can add to what a mount
+enforces; it can never lower it.
 
 `Meta` is exempt, exactly as it is in the kernel: self-description stays readable wherever
 the catalog offers it, so an agent can still learn what it would need in order to ask.
+
+## What crosses the boundary, and how it stays whole
+
+Three things a module boundary used to drop, each carried since 0.3 by an **appended**
+protocol message — postcard keys an enum on its variant index, so every 0.2 message keeps
+its bytes:
+
+- **The error's type.** `ModuleReply::Error(String)` was the only failure shape, so a
+  module-side capability refusal arrived at the host as `Error::Endpoint` — neither
+  permanent nor transient, so a `Retry` overlay could re-issue a denial forever. A failure
+  now crosses as `ModuleError`, the taxonomy mirror `ikigai-wire` adopted in v7, in **both**
+  directions (`ModuleReply::ErrorTyped`, `ModuleCall::HostError`): a module-side `Denied`
+  is a permanent `Denied` at the host, and a host resource's `NotFound` is `NotFound` inside
+  the module.
+- **The result's declared golden threads.** `Representation::threads` is `serde(skip)` in
+  core (cache provenance is a per-kernel concern), so a module endpoint's own `depends_on`
+  never crossed loopback, socket or wasm — a cacheable result was cached **forever with
+  nothing to cut it**, and a `Sink` through the mount left it stale. `ModuleReply::ResolvedThreaded`
+  carries the thread names beside the bytes and the host re-attaches them. (The threads of
+  host resources a module resolves through its callbacks never needed to cross: the host
+  records those on the outer invocation.)
+- **The module's cards.** `ModuleSpace::connect` asks for every binding's `describe()`
+  (`ModuleCall::Cards`) and installs them beside the host's own, the floor folded in — so
+  an endpoint describes itself through the mount, inputs, outputs and its own `requires`,
+  exactly as it would linked. A card crosses as JSON text inside the postcard frame: core's
+  `Description` derives serde for JSON and postcard is not self-describing.
+
+Both directions send the old untyped message whenever it is lossless (an `Error::Endpoint`
+is exactly a string; a threadless result is exactly a `Resolved`) and the new one only when
+the old would lose something, so a mixed-version pairing degrades on those paths alone.
+
+**Who enumerates.** Through 0.2 the two spaces disagreed: `ModuleSpace::entries()` was the
+module's live answer, `WasmModuleSpace::entries()` the host's declared cards. One rule now:
+**a space lists every pattern it holds a card for — the host's first, then the module's —
+then whatever the module says it binds under the routed prefixes**, each pattern once.
+`WasmModuleSpace` follows the same rule and simply holds no module cards, because asking a
+lazy module means loading it: the two spaces differ in what they can *know*, not in the rule.
+A host card wins resolution for its pattern; a pattern may be an exact IRI or a URI template.
+
+## Conformance
+
+`tests/conformance.rs` runs [`ikigai-conformance`](https://crates.io/crates/ikigai-conformance)
+over one fixture module walked bare and through every mount — `ModuleSpace::connect` over
+the in-process transport, the loopback codec and a Unix socket, and `WasmModuleSpace` over
+the browser's out-of-band split — and holds every report to the bare one: the same catalog,
+the same description per entry verbatim, cacheability by thread name, every error type
+preserved in both directions, the module's declared canonical adopted by the host. It passes
+clean. The one state it cannot hold is a mount made with `new`, which is pinned as what it is:
+one endpoint named `module`, with no actions.
 
 ## Composing a rewriting space in a module
 
