@@ -1,13 +1,22 @@
 [package]
 name = "ikigai-module"
-# 0.2.0, not 0.1.11: cargo treats 0.1.x as one compatible range, and this is a BREAKING
+# 0.3.0: the module PROTOCOL grows, and `ModuleCall` / `ModuleReply` are public exhaustive
+# enums, so a new variant is source-breaking for any exhaustive match outside this crate.
+# The wire itself does not break — every 0.2 message keeps its bytes (postcard keys an enum
+# on its variant index; the new variants are appended) — but a mixed pairing degrades on
+# the paths the new messages cover: an old host cannot decode a typed failure or a threaded
+# result from a new module, an old module cannot decode a typed failure from a new host.
+# Every success and every `Error::Endpoint` still crosses in the 0.2 shape. Also breaking:
+# `serve_host_call`'s resolver returns the kernel's typed `Error`, not a `String`.
+#
+# (0.2.0, not 0.1.11: cargo treats 0.1.x as one compatible range, and that was a BREAKING
 # change in both directions. Source-breaking — `ModuleSpace::new`, `ModuleSpace::connect` and
 # `WasmModuleSpace::new` each take a `ModuleFloor` by value, so every mount site must state
 # what the module may do (the compile error IS the review trigger; a floor that could be
 # omitted would be the hole this closes). Behavior-breaking — a module endpoint's declared
 # `requires` is now ENFORCED across the boundary, so a caller that used to reach an
-# under-capability'd module endpoint is now correctly denied.
-version = "0.2.0"
+# under-capability'd module endpoint is now correctly denied.)
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -29,6 +38,10 @@ keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 ikigai-core = "0.1.64"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
+# A module's card crosses the wire as JSON text inside the postcard frame: core's
+# `Description` derives serde for JSON (`skip_serializing_if`), and postcard is not
+# self-describing, so it cannot ride the frame directly. See `ModuleCard`.
+serde_json = "1"
 # The loopback transport runs the ModuleCall/ModuleReply session over in-memory byte
 # channels: futures for the channels + lock + join!, postcard for the codec (the same
 # postcard framing ikigai-wire uses; `alloc` keeps it wasm-clean).
@@ -40,3 +53,11 @@ postcard = { version = "1", features = ["alloc"] }
 # and Windows never pull it; the crate stays wasm-clean.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# The module recipe as one test, across the boundary (`tests/conformance.rs`): one fixture
+# module walked bare and through every mount, every report held to the bare one —
+# identical catalog and descriptions, cacheability by thread name, every error type
+# preserved in both directions. 0.1.0 pulls ikigai-core 0.1.67, which the caret above
+# admits; the library itself needs nothing past its own pin.
+ikigai-conformance = "0.1.0"

@@ -57,6 +57,29 @@
 //! one `.requires(..)` declaration means the same thing whether an endpoint is linked or
 //! loaded.
 //!
+//! ## What crosses the boundary, and how it stays whole
+//!
+//! Three things a module boundary used to drop, each carried since 0.3 by an **appended**
+//! message, so every earlier message keeps its bytes:
+//!
+//! - **The error's type.** A failure crosses as [`ModuleError`] — the taxonomy mirror
+//!   `ikigai-wire` adopted in v7 — in both directions ([`ModuleReply::ErrorTyped`],
+//!   [`ModuleCall::HostError`]), so a module-side `Denied` is permanent at the host and a
+//!   host resource's `NotFound` is `NotFound` inside the module.
+//! - **The result's declared golden threads.** `Representation::threads` is `serde(skip)`, so
+//!   [`ModuleReply::ResolvedThreaded`] carries their names beside the bytes and the host
+//!   re-attaches them; a module endpoint's `depends_on` cuts over a socket exactly as it does
+//!   in-process. (The threads of host resources a module resolves through its callbacks never
+//!   needed to cross — the host records those on the outer invocation.)
+//! - **The module's cards.** [`ModuleSpace::connect`] asks for every binding's `describe()`
+//!   ([`ModuleCall::Cards`]) and installs them beside the host's own, so an endpoint describes
+//!   itself through the mount — inputs, outputs, its own `requires` — exactly as it would
+//!   linked, the floor folded in. A mount made with [`ModuleSpace::new`] never asks, and
+//!   describes an IRI the host declared nothing for with its generic card.
+//!
+//! `tests/conformance.rs` holds all three to the linked case: one fixture module walked bare
+//! and through every mount, every report the bare one's.
+//!
 //! ## A module may compose a rewriting space
 //!
 //! Any space should be composable in any module — including one that resolves one name
@@ -85,8 +108,8 @@ use futures::lock::Mutex as AsyncMutex;
 use futures::StreamExt;
 use ikigai_core::{
     AliasParseError, AliasTable, Bindings, Canonical, Capability, Description, Endpoint, Error,
-    Expiry, FnEndpoint, Invocation, Iri, Issuer, Representation, Request, Resolution, Resolved,
-    Result, Scope, Space, SpaceEntry, Thread, Verb,
+    Expiry, FnEndpoint, Grammar, Invocation, Iri, Issuer, Representation, Request, Resolution,
+    Resolved, Result, Scope, Space, SpaceEntry, Thread, UriTemplate, Verb,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -113,7 +136,11 @@ pub enum ModuleCall {
         request: Request,
         capability: Capability,
     },
-    /// The host's answer to a [`ModuleReply::HostCall`] the module made.
+    /// The host's answer to a [`ModuleReply::HostCall`] the module made — `Ok` for every
+    /// success, `Err` for a failure that was an [`Error::Endpoint`] (the one variant a bare
+    /// string carries losslessly). Any other failure is answered with
+    /// [`HostError`](ModuleCall::HostError), typed; a host older than that variant answers
+    /// `Err(text)` for everything, which a module reads as `Error::Endpoint`.
     HostResult(std::result::Result<Representation, String>),
     /// Ask for the module's bound entries (for `entries()` / the catalog).
     Describe,
@@ -127,6 +154,19 @@ pub enum ModuleCall {
     /// fails to decode the call and answers [`ModuleReply::Error`], which a host reads
     /// as "cannot say" — [`ModuleRewrite::Unknown`], never "does not rewrite".
     Manifest,
+    /// The host's answer to a [`ModuleReply::HostCall`] that **failed**, with the failure's
+    /// type intact — so a module's `inv.source` of a host resource that is denied sees
+    /// [`Error::Denied`] (permanent), not an `Endpoint` string it might retry. Appended, so
+    /// every earlier message keeps its bytes; a module older than this variant cannot decode
+    /// it and its callback fails with a decode error where it used to get the text — on the
+    /// failure path only, since a success still rides [`HostResult`](ModuleCall::HostResult).
+    HostError(ModuleError),
+    /// Ask the module for every bound entry's [`ModuleCard`] — each endpoint's own
+    /// `describe()`, which [`ModuleSpace::connect`] installs host-side so an endpoint
+    /// describes itself through the mount exactly as it would linked. Appended; a module
+    /// older than this variant fails to decode it and answers [`ModuleReply::Error`] (or
+    /// drops the connection), which a host reads as "no cards", never as a failure.
+    Cards,
 }
 
 /// module → host.
@@ -138,21 +178,286 @@ pub enum ModuleReply {
         request: Request,
         capability: Capability,
     },
-    /// The invocation finished with a representation.
+    /// The invocation finished with a representation that declares no golden thread of its
+    /// own. (`Representation::threads` is `serde(skip)`, so this shape cannot carry one; a
+    /// result that declares threads crosses as
+    /// [`ResolvedThreaded`](ModuleReply::ResolvedThreaded) instead.)
     Resolved(Representation),
-    /// The invocation failed.
+    /// The invocation failed with an [`Error::Endpoint`] — the one variant a bare string
+    /// carries losslessly, so a current module still answers it this way and a 0.2 host reads
+    /// it unchanged. Every other failure crosses as [`ErrorTyped`](ModuleReply::ErrorTyped).
     ///
-    /// ⚠ A string, so the error's **type** does not cross the wire: a module-side denial
-    /// (`refuse_unsatisfied_declaration`) arrives at the host as [`Error::Endpoint`], not
-    /// [`Error::Denied`] — and only `Denied` is permanent, so a retrying caller may treat a
-    /// refusal as transient. The mount's [`ModuleFloor`] is unaffected: it is checked
-    /// host-side, on this side of the wire, and returns a real `Error::Denied`.
+    /// Before 0.3 this was the only failure shape: a module-side denial arrived at the host
+    /// as `Error::Endpoint`, and only `Denied` is permanent, so a retrying caller could treat
+    /// a capability refusal as transient.
     Error(String),
     /// The answer to a [`ModuleCall::Describe`].
     Bindings(Option<Vec<SpaceEntry>>),
-    /// The answer to a [`ModuleCall::Manifest`]. Appended last, for the same
+    /// The answer to a [`ModuleCall::Manifest`]. Appended after `Bindings`, for the same
     /// index-stability reason `Manifest` was.
     Manifest(ModuleManifest),
+    /// The invocation failed, and the failure keeps its **type**: the host rebuilds the same
+    /// [`Error`] variant the module's endpoint raised, so a module-side denial is a permanent
+    /// `Denied` at the host, a module's timeout stays transient, and the conformance suite's
+    /// ENFORCED check holds across the boundary. The shape `ikigai-wire` adopted in v7.
+    /// Appended; a host older than this variant cannot decode it and reports a decode error
+    /// where it used to get the text — on the failure path only.
+    ErrorTyped(ModuleError),
+    /// The invocation finished with a representation **and the golden threads its endpoint
+    /// declared on it** (`Representation::threads` is `serde(skip)` — cache provenance is a
+    /// per-kernel concern in core — so the module protocol carries them beside it). The host
+    /// re-attaches them, so a module endpoint's `depends_on` cuts through every transport as
+    /// it does in-process. Sent only when the set is non-empty; a threadless result still
+    /// rides [`Resolved`](ModuleReply::Resolved), which an older host decodes.
+    ResolvedThreaded {
+        /// The result, its threads stripped by the codec.
+        representation: Representation,
+        /// The names of the threads the endpoint declared on it.
+        threads: Vec<String>,
+    },
+    /// The answer to a [`ModuleCall::Cards`].
+    Cards(Vec<ModuleCard>),
+}
+
+// ---------------------------------------------------------------------------
+// ★ Failures keep their type across the boundary.
+//
+// `ModuleReply::Error(String)` was the only failure shape through 0.2, and it dropped the
+// one thing the other side needs: the TYPE. A module-side capability refusal arrived at the
+// host as `Error::Endpoint`, which is neither permanent nor transient in the kernel's
+// taxonomy — so a Retry overlay could re-issue a denial forever, a Failover could paper
+// over it, and the conformance suite's ENFORCED check (which wants a typed `Denied`) could
+// never pass for a loaded endpoint. The host→module direction had the same hole in
+// `HostResult(Err(String))`: a module resolving a host resource that is `NotFound` saw an
+// endpoint string.
+//
+// `ModuleError` is the taxonomy on this wire, the shape `ikigai-wire` adopted in v7: a
+// module-local mirror of `ikigai_core::Error`, so a core taxonomy addition is a PROTOCOL
+// event here (a socket or wasm peer implements this codec independently), not a silent
+// cascade. Both directions send the old untyped message whenever it is lossless — an
+// `Error::Endpoint` is exactly a string — and the typed one only when the old would lose
+// something, so a mixed-version pairing degrades on the failure path alone. The same rule
+// carries a result's declared golden threads: `ResolvedThreaded` only when there are any.
+// ---------------------------------------------------------------------------
+
+/// The error taxonomy on the module wire — a field-for-field mirror of [`Error`], kept
+/// module-local so a taxonomy addition in core is a module-protocol event, never a silent
+/// cascade. Variant order is the postcard contract: append only.
+///
+/// A failure crosses and comes back as the variant it was, transience included:
+///
+/// ```
+/// use ikigai_core::Error;
+/// use ikigai_module::ModuleError;
+///
+/// let denied = Error::Denied("not yours".to_string());
+/// let back: Error = ModuleError::from(&denied).into();
+/// assert_eq!(back, denied);
+/// assert!(!back.is_transient(), "a denial stays permanent across the boundary");
+///
+/// let timeout = Error::Timeout("slow".to_string());
+/// let back: Error = ModuleError::from(&timeout).into();
+/// assert_eq!(back, timeout);
+/// assert!(back.is_transient());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModuleError {
+    /// The module's space found no binding for the target (the IRI, as text).
+    Unresolved(String),
+    /// A required argument was absent.
+    MissingArgument(String),
+    /// An argument was present but unusable.
+    InvalidArgument {
+        /// The argument name.
+        name: String,
+        /// What was wrong with it.
+        detail: String,
+    },
+    /// The endpoint failed while producing its representation.
+    Endpoint(String),
+    /// Permanent: the capability did not authorize it.
+    Denied(String),
+    /// Permanent: a bound endpoint reports the thing it fronts absent.
+    NotFound(String),
+    /// Transient.
+    Timeout(String),
+    /// Transient.
+    Unavailable(String),
+}
+
+impl From<&Error> for ModuleError {
+    fn from(error: &Error) -> Self {
+        match error {
+            Error::Unresolved(iri) => ModuleError::Unresolved(iri.as_str().to_string()),
+            Error::MissingArgument(name) => ModuleError::MissingArgument(name.clone()),
+            Error::InvalidArgument { name, detail } => ModuleError::InvalidArgument {
+                name: name.clone(),
+                detail: detail.clone(),
+            },
+            Error::Endpoint(message) => ModuleError::Endpoint(message.clone()),
+            Error::Denied(message) => ModuleError::Denied(message.clone()),
+            Error::NotFound(message) => ModuleError::NotFound(message.clone()),
+            Error::Timeout(message) => ModuleError::Timeout(message.clone()),
+            Error::Unavailable(message) => ModuleError::Unavailable(message.clone()),
+            // `Error` is `non_exhaustive`: a variant newer than this protocol revision
+            // degrades to `Endpoint` (message preserved) until the protocol catches up — a
+            // taxonomy addition is a protocol event, and an older peer meanwhile sees a
+            // correct-if-untyped failure.
+            other => ModuleError::Endpoint(other.to_string()),
+        }
+    }
+}
+
+impl From<ModuleError> for Error {
+    fn from(error: ModuleError) -> Self {
+        match error {
+            // The IRI crossed the wire FROM an `Iri`, so a parse failure here is corruption;
+            // degrade to `Endpoint` rather than panic.
+            ModuleError::Unresolved(iri) => match Iri::parse(&iri) {
+                Ok(iri) => Error::Unresolved(iri),
+                Err(_) => Error::Endpoint(format!("no endpoint resolved for {iri}")),
+            },
+            ModuleError::MissingArgument(name) => Error::MissingArgument(name),
+            ModuleError::InvalidArgument { name, detail } => {
+                Error::InvalidArgument { name, detail }
+            }
+            ModuleError::Endpoint(message) => Error::Endpoint(message),
+            ModuleError::Denied(message) => Error::Denied(message),
+            ModuleError::NotFound(message) => Error::NotFound(message),
+            ModuleError::Timeout(message) => Error::Timeout(message),
+            ModuleError::Unavailable(message) => Error::Unavailable(message),
+        }
+    }
+}
+
+/// One bound entry of a module and the card its endpoint answers `Meta` with — what a
+/// [`ModuleCall::Cards`] returns per binding, and what [`ModuleSpace::connect`] installs
+/// host-side so the mount describes the module's endpoints as the module does.
+///
+/// The card is the module's word about what it DOES — inputs, outputs, verbs, and any
+/// `requires` of its own. The host folds its [`ModuleFloor`] into it before the kernel sees
+/// it, so a module's card can only ever add to what the mount enforces, never lower it.
+///
+/// On the wire the description crosses as **JSON text** inside the postcard frame: core's
+/// `Description` derives serde for JSON (`skip_serializing_if` on its optional fields), and
+/// postcard is not self-describing, so a skipped field reads as "end of buffer" on the way
+/// back. The text form is the same choice [`ModuleRewrite::Table`] makes for the alias
+/// table. `card_survives_the_codec` pins the round trip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleCard {
+    /// The binding: its pattern (an exact IRI or a URI template) and the endpoint's name.
+    pub entry: SpaceEntry,
+    /// The endpoint's self-description, as `describe()` answers it inside the module.
+    pub description: Description,
+}
+
+/// [`ModuleCard`]'s wire shape: the entry as it is, the description as JSON text.
+#[derive(Serialize, Deserialize)]
+struct ModuleCardWire {
+    entry: SpaceEntry,
+    description: String,
+}
+
+impl Serialize for ModuleCard {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let description =
+            serde_json::to_string(&self.description).map_err(serde::ser::Error::custom)?;
+        ModuleCardWire {
+            entry: self.entry.clone(),
+            description,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModuleCard {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let wire = ModuleCardWire::deserialize(deserializer)?;
+        let description =
+            serde_json::from_str(&wire.description).map_err(serde::de::Error::custom)?;
+        Ok(ModuleCard {
+            entry: wire.entry,
+            description,
+        })
+    }
+}
+
+/// The module's reply for an endpoint's outcome: the 0.2 shape whenever it is lossless (a
+/// threadless result, an `Endpoint` error), the threaded or typed one otherwise.
+fn reply_for(result: Result<Representation>) -> ModuleReply {
+    match result {
+        Ok(representation) => {
+            let threads: Vec<String> = representation
+                .threads()
+                .iter()
+                .map(|thread| thread.as_str().to_string())
+                .collect();
+            if threads.is_empty() {
+                ModuleReply::Resolved(representation)
+            } else {
+                ModuleReply::ResolvedThreaded {
+                    representation,
+                    threads,
+                }
+            }
+        }
+        Err(Error::Endpoint(message)) => ModuleReply::Error(message),
+        Err(other) => ModuleReply::ErrorTyped(ModuleError::from(&other)),
+    }
+}
+
+/// What a module's final reply means to the host: the representation with its declared
+/// threads re-attached, or the failure — typed where the wire carried the type.
+fn outcome_from(reply: ModuleReply) -> Result<Representation> {
+    match reply {
+        ModuleReply::Resolved(representation) => Ok(representation),
+        ModuleReply::ResolvedThreaded {
+            representation,
+            threads,
+        } => Ok(threads
+            .into_iter()
+            .fold(representation, |representation, thread| {
+                representation.depends_on(thread)
+            })),
+        ModuleReply::Error(message) => Err(Error::Endpoint(message)),
+        ModuleReply::ErrorTyped(error) => Err(error.into()),
+        ModuleReply::HostCall { .. } => Err(Error::Endpoint(
+            "module made a HostCall where a final reply was expected".to_string(),
+        )),
+        ModuleReply::Bindings(_) | ModuleReply::Manifest(_) | ModuleReply::Cards(_) => Err(
+            Error::Endpoint("module answered Invoke with a description".to_string()),
+        ),
+    }
+}
+
+/// The host's answer to one callback: `HostResult` whenever it is lossless, `HostError` for
+/// a failure whose type a string would drop.
+fn host_answer(result: Result<Representation>) -> ModuleCall {
+    match result {
+        Ok(representation) => ModuleCall::HostResult(Ok(representation)),
+        Err(Error::Endpoint(message)) => ModuleCall::HostResult(Err(message)),
+        Err(other) => ModuleCall::HostError(ModuleError::from(&other)),
+    }
+}
+
+/// What the host's answer to a callback means to the module's issuer.
+fn answer_from(call: ModuleCall) -> Result<Representation> {
+    match call {
+        ModuleCall::HostResult(Ok(representation)) => Ok(representation),
+        ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
+        ModuleCall::HostError(error) => Err(error.into()),
+        ModuleCall::Invoke { .. }
+        | ModuleCall::Describe
+        | ModuleCall::Manifest
+        | ModuleCall::Cards => Err(Error::Endpoint(
+            "expected HostResult answering a HostCall".to_string(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +871,102 @@ fn refuse_unsatisfied_declaration(
     ))
 }
 
+/// The value a template variable is probed with to reach the endpoint behind a template
+/// binding for its card — what core's (private) `describe_entry` does.
+const PROBE: &str = "probe";
+
+/// The card of one bound entry, as the module's own space answers it: a `Meta` resolution
+/// of the pattern (an exact IRI), or of the template expanded with a probe value — guarded,
+/// as core guards it, against a shorter sibling swallowing the probe.
+fn describe_entry(space: &dyn Space, entry: &SpaceEntry) -> Option<Description> {
+    let (target, templated) = match Iri::parse(&entry.pattern) {
+        Ok(iri) => (iri, false),
+        Err(_) => {
+            let template = UriTemplate::parse(&entry.pattern).ok()?;
+            let mut bindings = Bindings::new();
+            for var in template.variables() {
+                bindings.insert(var, PROBE);
+            }
+            if bindings.is_empty() {
+                return None; // no variables ⇒ a malformed IRI, not a template
+            }
+            (Iri::parse(template.expand(&bindings)?).ok()?, true)
+        }
+    };
+    let Resolution::Hit(resolved) =
+        space.resolve(&Request::new(Verb::Meta, target), &Scope::empty())
+    else {
+        return None;
+    };
+    let description = resolved.endpoint.describe();
+    if templated && resolved.endpoint.name() != entry.endpoint && description.id != entry.endpoint {
+        return None;
+    }
+    Some(description)
+}
+
+/// Every bound entry's card — the module side of [`ModuleCall::Cards`].
+fn cards_of(space: &dyn Space) -> Vec<ModuleCard> {
+    space
+        .entries()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            describe_entry(space, &entry).map(|description| ModuleCard { entry, description })
+        })
+        .collect()
+}
+
+/// The first card whose pattern matches `target` — an exact IRI or a URI template, in
+/// declaration order, the precedence `EndpointSpace` gives its bindings. Each item is
+/// `(pattern, endpoint name, card)`.
+fn match_card<'a>(
+    cards: impl IntoIterator<Item = (&'a str, &'a str, &'a Description)>,
+    target: &Iri,
+) -> Option<(&'a str, &'a Description)> {
+    cards
+        .into_iter()
+        .find(|(pattern, _, _)| {
+            *pattern == target.as_str()
+                || UriTemplate::parse(*pattern)
+                    .ok()
+                    .is_some_and(|template| template.match_iri(target).is_some())
+        })
+        .map(|(_, name, card)| (name, card))
+}
+
+/// The module side of one `Invoke`, over whatever issuer carries its callbacks: resolve in
+/// the module's space, apply the two guards, invoke, and shape the reply. One place, so the
+/// transports (direct call, byte channel, socket, closure pump) cannot drift on what crosses.
+async fn dispatch(
+    space: &dyn Space,
+    rewrite: &ModuleRewrite,
+    request: &Request,
+    capability: &Capability,
+    issuer: &dyn Issuer,
+) -> ModuleReply {
+    match space.resolve(request, &Scope::empty()) {
+        Resolution::Hit(resolved) => {
+            // The identity guard: a rewrite the host was never told about would file this
+            // answer under the wrong name. Refuse rather than serve it.
+            if let Some(message) = refuse_undeclared_rewrite(request, &resolved, rewrite) {
+                return ModuleReply::Error(message);
+            }
+            // The authority guard: the module honoring its own card. The mount's floor has
+            // already gated this host-side and is the authoritative floor; this can only
+            // ever deny more — and it crosses typed, so the host sees a permanent `Denied`.
+            if let Some(message) = refuse_unsatisfied_declaration(request, &resolved, capability) {
+                return ModuleReply::ErrorTyped(ModuleError::Denied(message));
+            }
+            let inv = Invocation::with_issuer(request, &resolved.bindings, capability, issuer);
+            reply_for(resolved.endpoint.invoke(&inv).await)
+        }
+        Resolution::Miss => {
+            ModuleReply::ErrorTyped(ModuleError::Unresolved(request.target.as_str().to_string()))
+        }
+    }
+}
+
 /// What routing a target through a module's declared canonicalization decided.
 enum Routing {
     /// Resolve under the name as given.
@@ -731,6 +1132,17 @@ pub trait ModuleTransport: Send + Sync {
     async fn manifest(&self) -> Result<ModuleManifest> {
         Ok(ModuleManifest::unknown(self.entries()))
     }
+
+    /// Ask the module for its bound entries' cards ([`ModuleCard`]) — every endpoint's own
+    /// `describe()`, so the host can hand the kernel the module's self-description through
+    /// the mount. Asked **once, at mount time** ([`ModuleSpace::connect`]), beside
+    /// [`manifest`](Self::manifest).
+    ///
+    /// The default answers none — the honest answer for a transport that cannot carry the
+    /// question, and for a peer older than [`ModuleCall::Cards`].
+    async fn cards(&self) -> Result<Vec<ModuleCard>> {
+        Ok(Vec::new())
+    }
 }
 
 /// **Phase 1.** The module runs in the same process; "transport" is a direct call. The
@@ -791,30 +1203,10 @@ impl ModuleTransport for InProcessTransport {
         capability: &Capability,
         host: &dyn Issuer,
     ) -> Result<Representation> {
-        match self.space.resolve(&request, &Scope::empty()) {
-            Resolution::Hit(resolved) => {
-                // The identity guard: a rewrite the host was never told about would file
-                // this answer under the wrong name. Refuse rather than serve it.
-                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, &self.rewrite)
-                {
-                    return Err(Error::Endpoint(message));
-                }
-                // The authority guard: the module's own card, honored by the module. The
-                // mount's `ModuleFloor` has already gated this host-side and is the
-                // authoritative floor; this can only ever deny more. See
-                // `refuse_unsatisfied_declaration`.
-                if let Some(message) =
-                    refuse_unsatisfied_declaration(&request, &resolved, capability)
-                {
-                    return Err(Error::Denied(message));
-                }
-                // Run the module's endpoint with the HOST as its issuer: its
-                // `inv.source(..)` calls cross back to the host kernel.
-                let inv = Invocation::with_issuer(&request, &resolved.bindings, capability, host);
-                resolved.endpoint.invoke(&inv).await
-            }
-            Resolution::Miss => Err(Error::Unresolved(request.target.clone())),
-        }
+        // The same dispatch the wire transports run, shortcut: no codec between the module's
+        // reply and the host's reading of it. The module's endpoint runs with the HOST as its
+        // issuer, so its `inv.source(..)` calls cross straight back to the host kernel.
+        outcome_from(dispatch(&*self.space, &self.rewrite, &request, capability, host).await)
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -827,6 +1219,10 @@ impl ModuleTransport for InProcessTransport {
             self.space.entries(),
             self.rewrite.clone(),
         ))
+    }
+
+    async fn cards(&self) -> Result<Vec<ModuleCard>> {
+        Ok(cards_of(&*self.space))
     }
 }
 
@@ -939,19 +1335,10 @@ impl ModuleTransport for LoopbackTransport {
                         capability: carried,
                     } => {
                         let clamped = capability.clamp(&carried);
-                        let result = host
-                            .issue(request, &clamped)
-                            .await
-                            .map_err(|e| e.to_string());
-                        send(&host_to_module_tx, &ModuleCall::HostResult(result))?;
+                        let answer = host_answer(host.issue(request, &clamped).await);
+                        send(&host_to_module_tx, &answer)?;
                     }
-                    ModuleReply::Resolved(representation) => return Ok(representation),
-                    ModuleReply::Error(message) => return Err(Error::Endpoint(message)),
-                    ModuleReply::Bindings(_) | ModuleReply::Manifest(_) => {
-                        return Err(Error::Endpoint(
-                            "module answered Invoke with a description".to_string(),
-                        ))
-                    }
+                    reply => return outcome_from(reply),
                 }
             }
         };
@@ -1003,6 +1390,37 @@ impl ModuleTransport for LoopbackTransport {
         let (_module_done, result) = futures::join!(module_side, host_side);
         result
     }
+
+    async fn cards(&self) -> Result<Vec<ModuleCard>> {
+        // Through the codec, like `manifest`: a card is only worth anything if it survives
+        // serialization.
+        let (host_to_module_tx, host_to_module_rx) = mpsc::unbounded::<Vec<u8>>();
+        let (module_to_host_tx, mut module_to_host_rx) = mpsc::unbounded::<Vec<u8>>();
+        let module_side = run_module_session(
+            Arc::clone(&self.space),
+            self.rewrite.clone(),
+            host_to_module_rx,
+            module_to_host_tx,
+        );
+        let host_side = async {
+            send(&host_to_module_tx, &ModuleCall::Cards)?;
+            let bytes = module_to_host_rx
+                .next()
+                .await
+                .ok_or_else(|| Error::Endpoint("module closed the session early".to_string()))?;
+            match decode::<ModuleReply>(&bytes)? {
+                ModuleReply::Cards(cards) => Ok(cards),
+                // A peer that predates `Cards` fails to decode the call and answers `Error`:
+                // no cards, not a failure.
+                ModuleReply::Error(_) => Ok(Vec::new()),
+                _ => Err(Error::Endpoint(
+                    "module answered Cards with something else".to_string(),
+                )),
+            }
+        };
+        let (_module_done, result) = futures::join!(module_side, host_side);
+        result
+    }
 }
 
 /// Send a `postcard`-encoded message down a byte channel.
@@ -1028,43 +1446,21 @@ async fn run_module_session(
         Ok(ModuleCall::Invoke {
             request,
             capability,
-        }) => match space.resolve(&request, &Scope::empty()) {
-            Resolution::Hit(resolved) => {
-                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, &rewrite) {
-                    ModuleReply::Error(message)
-                } else if let Some(message) =
-                    refuse_unsatisfied_declaration(&request, &resolved, &capability)
-                {
-                    // The module honoring its own card; the mount's floor already gated this
-                    // host-side. ⚠ `ModuleReply::Error` carries no error TYPE, so this
-                    // arrives at the host as `Error::Endpoint`, not `Error::Denied` — see
-                    // the note on `ModuleReply::Error`.
-                    ModuleReply::Error(message)
-                } else {
-                    // The issuer now owns the receiver: after `Invoke`, every inbound
-                    // message is a `HostResult` answering one of its `HostCall`s.
-                    let issuer = SessionHostIssuer {
-                        to_host: to_host.clone(),
-                        from_host: AsyncMutex::new(from_host),
-                    };
-                    let inv =
-                        Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
-                    match resolved.endpoint.invoke(&inv).await {
-                        Ok(representation) => ModuleReply::Resolved(representation),
-                        Err(e) => ModuleReply::Error(e.to_string()),
-                    }
-                }
-            }
-            Resolution::Miss => ModuleReply::Error(format!(
-                "module did not resolve {}",
-                request.target.as_str()
-            )),
-        },
+        }) => {
+            // The issuer now owns the receiver: after `Invoke`, every inbound message is the
+            // host's answer to one of its `HostCall`s.
+            let issuer = SessionHostIssuer {
+                to_host: to_host.clone(),
+                from_host: AsyncMutex::new(from_host),
+            };
+            dispatch(&*space, &rewrite, &request, &capability, &issuer).await
+        }
         Ok(ModuleCall::Describe) => ModuleReply::Bindings(space.entries()),
         Ok(ModuleCall::Manifest) => {
             ModuleReply::Manifest(ModuleManifest::new(space.entries(), rewrite))
         }
-        Ok(ModuleCall::HostResult(_)) => {
+        Ok(ModuleCall::Cards) => ModuleReply::Cards(cards_of(&*space)),
+        Ok(ModuleCall::HostResult(_) | ModuleCall::HostError(_)) => {
             ModuleReply::Error("module received HostResult before Invoke".to_string())
         }
         Err(e) => ModuleReply::Error(e.to_string()),
@@ -1101,13 +1497,7 @@ impl Issuer for SessionHostIssuer {
                 .await
                 .ok_or_else(|| Error::Endpoint("host closed the session".to_string()))?
         };
-        match decode::<ModuleCall>(&bytes)? {
-            ModuleCall::HostResult(Ok(representation)) => Ok(representation),
-            ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
-            _ => Err(Error::Endpoint(
-                "expected HostResult answering a HostCall".to_string(),
-            )),
-        }
+        answer_from(decode::<ModuleCall>(&bytes)?)
     }
 }
 
@@ -1167,36 +1557,18 @@ where
         Ok(ModuleCall::Invoke {
             request,
             capability,
-        }) => match space.resolve(&request, &Scope::empty()) {
-            Resolution::Hit(resolved) => {
-                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, rewrite) {
-                    ModuleReply::Error(message)
-                } else if let Some(message) =
-                    refuse_unsatisfied_declaration(&request, &resolved, &capability)
-                {
-                    ModuleReply::Error(message)
-                } else {
-                    let issuer = ClosureHostIssuer {
-                        host_call: &host_call,
-                    };
-                    let inv =
-                        Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
-                    match resolved.endpoint.invoke(&inv).await {
-                        Ok(representation) => ModuleReply::Resolved(representation),
-                        Err(e) => ModuleReply::Error(e.to_string()),
-                    }
-                }
-            }
-            Resolution::Miss => ModuleReply::Error(format!(
-                "module did not resolve {}",
-                request.target.as_str()
-            )),
-        },
+        }) => {
+            let issuer = ClosureHostIssuer {
+                host_call: &host_call,
+            };
+            dispatch(&**space, rewrite, &request, &capability, &issuer).await
+        }
         Ok(ModuleCall::Describe) => ModuleReply::Bindings(space.entries()),
         Ok(ModuleCall::Manifest) => {
             ModuleReply::Manifest(ModuleManifest::new(space.entries(), rewrite.clone()))
         }
-        Ok(ModuleCall::HostResult(_)) => {
+        Ok(ModuleCall::Cards) => ModuleReply::Cards(cards_of(&**space)),
+        Ok(ModuleCall::HostResult(_) | ModuleCall::HostError(_)) => {
             ModuleReply::Error("module received HostResult before Invoke".to_string())
         }
         Err(e) => ModuleReply::Error(e.to_string()),
@@ -1231,13 +1603,7 @@ where
         let answer = (self.host_call)(encode(&host_call)?)
             .await
             .map_err(Error::Endpoint)?;
-        match decode::<ModuleCall>(&answer)? {
-            ModuleCall::HostResult(Ok(representation)) => Ok(representation),
-            ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
-            _ => Err(Error::Endpoint(
-                "expected HostResult answering a HostCall".to_string(),
-            )),
-        }
+        answer_from(decode::<ModuleCall>(&answer)?)
     }
 }
 
@@ -1321,32 +1687,37 @@ fn take_sink(id: u64) -> DepSink {
 
 /// Service one out-of-band `HostCall` for a module session: decode the host call, resolve
 /// the sub-request via `resolve` (the host kernel), record its provenance against every
-/// in-flight [`WasmModuleSpace`] invocation, and return the encoded `HostResult` (`Ok` or
-/// `Err` — either is a decodable answer). The host's global `hostCall` export calls this.
+/// in-flight [`WasmModuleSpace`] invocation, and return the encoded answer — a `HostResult`
+/// for a success, a `HostError` for a failure with its [`Error`] type intact (either is a
+/// decodable answer). The host's global `hostCall` export calls this.
 pub async fn serve_host_call<F, Fut>(reply: &[u8], resolve: F) -> Vec<u8>
 where
     F: FnOnce(Request, Capability) -> Fut,
-    Fut: core::future::Future<Output = std::result::Result<Representation, String>>,
+    Fut: core::future::Future<Output = Result<Representation>>,
 {
-    let result = match decode::<ModuleReply>(reply) {
+    let answer = match decode::<ModuleReply>(reply) {
         Ok(ModuleReply::HostCall {
             request,
             capability,
-        }) => match resolve(request, capability).await {
-            Ok(representation) => {
+        }) => {
+            let result = resolve(request, capability).await;
+            if let Ok(representation) = &result {
                 DEP_SINKS.with(|sinks| {
                     for (_, sink) in sinks.borrow().iter() {
-                        sink.borrow_mut().record(&representation);
+                        sink.borrow_mut().record(representation);
                     }
                 });
-                Ok(representation)
             }
-            Err(message) => Err(message),
-        },
-        Ok(_) => Err("serve_host_call: expected a HostCall".to_string()),
-        Err(e) => Err(format!("serve_host_call: undecodable HostCall: {e}")),
+            // Typed, so a module resolving a host resource that is denied or absent sees
+            // `Denied` / `NotFound`, not an endpoint string (see `ModuleError`).
+            host_answer(result)
+        }
+        Ok(_) => ModuleCall::HostResult(Err("serve_host_call: expected a HostCall".to_string())),
+        Err(e) => {
+            ModuleCall::HostResult(Err(format!("serve_host_call: undecodable HostCall: {e}")))
+        }
     };
-    encode(&ModuleCall::HostResult(result)).unwrap_or_default()
+    encode(&answer).unwrap_or_default()
 }
 
 /// A host-side [`Space`] that routes IRIs (by prefix) to a module reached over a
@@ -1416,8 +1787,10 @@ impl WasmModuleSpace {
         self
     }
 
-    /// Declare a concrete endpoint IRI and its self-description so it **enumerates into the
-    /// catalog** and answers `Meta` with its own card — without loading the module. The
+    /// Declare a bound pattern — an exact IRI or a URI template — and its self-description
+    /// so it **enumerates into the catalog** and answers `Meta` with its own card, without
+    /// loading the module. (A lazy module cannot be asked for its cards the way
+    /// [`ModuleSpace::connect`] asks: asking means loading. So here they are host data.) The
     /// host supplies these as static data (a tiny manifest); the catalog reads only
     /// `entries()` + `describe()` (pure metadata), so the wasm artifact is still fetched
     /// and instantiated lazily, on the first real `Source`/`Sink` against the IRI. Builder
@@ -1432,21 +1805,30 @@ impl WasmModuleSpace {
     /// mount's floor folded in**. The fallback is what used to make an undeclared IRI under
     /// the prefix *less* gated than a declared one; it cannot any more, because the floor
     /// applies to both arms.
-    fn card_for(&self, target: &str) -> Description {
+    fn card_for(&self, target: &Iri) -> Description {
         let card = self
-            .endpoints
-            .iter()
-            .find(|(iri, _)| iri == target)
-            .map(|(_, d)| d.clone())
+            .host_card(target)
+            .cloned()
             .unwrap_or_else(|| self.describe.clone());
         self.floor.applied_to(card)
+    }
+
+    /// The host-declared card matching `target`, if any — an exact IRI or a template.
+    fn host_card(&self, target: &Iri) -> Option<&Description> {
+        match_card(
+            self.endpoints
+                .iter()
+                .map(|(pattern, card)| (pattern.as_str(), card.id.as_str(), card)),
+            target,
+        )
+        .map(|(_, card)| card)
     }
 }
 
 impl Space for WasmModuleSpace {
     fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
         let target = request.target.as_str();
-        let matches = self.endpoints.iter().any(|(iri, _)| iri == target)
+        let matches = self.host_card(&request.target).is_some()
             || self.prefixes.iter().any(|p| target.starts_with(p.as_str()));
         if !matches {
             return Resolution::Miss;
@@ -1465,7 +1847,7 @@ impl Space for WasmModuleSpace {
         Resolution::Hit(Resolved {
             endpoint: Arc::new(WasmModuleEndpoint {
                 transport: Arc::clone(&self.transport),
-                describe: self.card_for(target),
+                describe: self.card_for(&request.target),
                 floor: self.floor.clone(),
             }),
             bindings: Bindings::new(),
@@ -1473,10 +1855,11 @@ impl Space for WasmModuleSpace {
         })
     }
 
+    /// Who enumerates: the same rule as [`ModuleSpace::entries`] — every pattern the space
+    /// holds a card for — which here means the host's, since a lazy module is never asked.
+    /// A bare prefix can't list its (open) IRI set. Empty => `None`, preserving the prior
+    /// "not in the catalog" behaviour for modules that declare nothing.
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        // Only the explicitly-declared endpoints enumerate; a bare prefix can't list its
-        // (open) IRI set. Empty => `None`, preserving the prior "not in the catalog"
-        // behaviour for modules that declare nothing.
         if self.endpoints.is_empty() {
             return None;
         }
@@ -1518,24 +1901,19 @@ impl Endpoint for WasmModuleEndpoint {
         let collected = take_sink(sink_id);
         let reply_bytes = result.map_err(Error::Endpoint)?;
 
-        match decode::<ModuleReply>(&reply_bytes)? {
-            ModuleReply::Resolved(representation) => {
-                // Re-attach the provenance the wire dropped, no more cacheable than inputs.
-                let expiry = match collected.expiry {
-                    Some(dep) => representation.expiry.most_restrictive(dep),
-                    None => representation.expiry,
-                };
-                let mut representation = representation.with_expiry(expiry);
-                for thread in collected.threads {
-                    representation = representation.depends_on(thread);
-                }
-                Ok(representation)
-            }
-            ModuleReply::Error(message) => Err(Error::Endpoint(message)),
-            _ => Err(Error::Endpoint(
-                "module returned an unexpected reply to Invoke".to_string(),
-            )),
+        // The module's own declared threads and a typed failure come back through
+        // `outcome_from`; the callbacks' provenance the host collected out-of-band is folded
+        // in here, no more cacheable than the inputs.
+        let representation = outcome_from(decode::<ModuleReply>(&reply_bytes)?)?;
+        let expiry = match collected.expiry {
+            Some(dep) => representation.expiry.most_restrictive(dep),
+            None => representation.expiry,
+        };
+        let mut representation = representation.with_expiry(expiry);
+        for thread in collected.threads {
+            representation = representation.depends_on(thread);
         }
+        Ok(representation)
     }
 
     fn name(&self) -> &str {
@@ -1709,20 +2087,10 @@ mod uds {
                         capability: carried,
                     } => {
                         let clamped = capability.clamp(&carried);
-                        let result = host
-                            .issue(request, &clamped)
-                            .await
-                            .map_err(|e| e.to_string());
-                        write_frame(&mut stream, &ModuleCall::HostResult(result))
-                            .map_err(io_err)?;
+                        let answer = host_answer(host.issue(request, &clamped).await);
+                        write_frame(&mut stream, &answer).map_err(io_err)?;
                     }
-                    ModuleReply::Resolved(representation) => return Ok(representation),
-                    ModuleReply::Error(message) => return Err(Error::Endpoint(message)),
-                    ModuleReply::Bindings(_) | ModuleReply::Manifest(_) => {
-                        return Err(Error::Endpoint(
-                            "module answered Invoke with a description".to_string(),
-                        ))
-                    }
+                    reply => return outcome_from(reply),
                 }
             }
         }
@@ -1749,6 +2117,17 @@ mod uds {
             Ok(match read_frame::<_, ModuleReply>(&mut stream) {
                 Ok(ModuleReply::Manifest(manifest)) => manifest,
                 _ => ModuleManifest::unknown(self.entries()),
+            })
+        }
+
+        async fn cards(&self) -> Result<Vec<ModuleCard>> {
+            let mut stream = UnixStream::connect(&self.path).map_err(io_err)?;
+            write_frame(&mut stream, &ModuleCall::Cards).map_err(io_err)?;
+            // A server older than `ModuleCall::Cards` cannot decode the frame and drops the
+            // connection: no cards, which is exactly what such a server can say.
+            Ok(match read_frame::<_, ModuleReply>(&mut stream) {
+                Ok(ModuleReply::Cards(cards)) => cards,
+                _ => Vec::new(),
             })
         }
     }
@@ -1856,7 +2235,8 @@ mod uds {
                 ModuleCall::Manifest => {
                     ModuleReply::Manifest(ModuleManifest::new(space.entries(), rewrite.clone()))
                 }
-                ModuleCall::HostResult(_) => {
+                ModuleCall::Cards => ModuleReply::Cards(cards_of(&*space)),
+                ModuleCall::HostResult(_) | ModuleCall::HostError(_) => {
                     ModuleReply::Error("server received HostResult before Invoke".to_string())
                 }
             };
@@ -1876,29 +2256,8 @@ mod uds {
         request: Request,
         capability: Capability,
     ) -> ModuleReply {
-        match space.resolve(&request, &Scope::empty()) {
-            Resolution::Hit(resolved) => {
-                if let Some(message) = refuse_undeclared_rewrite(&request, &resolved, rewrite) {
-                    return ModuleReply::Error(message);
-                }
-                if let Some(message) =
-                    refuse_unsatisfied_declaration(&request, &resolved, &capability)
-                {
-                    return ModuleReply::Error(message);
-                }
-                let issuer = SocketHostIssuer { stream };
-                let inv =
-                    Invocation::with_issuer(&request, &resolved.bindings, &capability, &issuer);
-                match resolved.endpoint.invoke(&inv).await {
-                    Ok(representation) => ModuleReply::Resolved(representation),
-                    Err(e) => ModuleReply::Error(e.to_string()),
-                }
-            }
-            Resolution::Miss => ModuleReply::Error(format!(
-                "module did not resolve {}",
-                request.target.as_str()
-            )),
-        }
+        let issuer = SocketHostIssuer { stream };
+        dispatch(&**space, rewrite, &request, &capability, &issuer).await
     }
 
     /// The module end of the callback channel over a socket: emit a `HostCall` frame and
@@ -1918,13 +2277,7 @@ mod uds {
             };
             let mut stream = self.stream;
             write_frame(&mut stream, &call).map_err(io_err)?;
-            match read_frame::<_, ModuleCall>(&mut stream).map_err(io_err)? {
-                ModuleCall::HostResult(Ok(representation)) => Ok(representation),
-                ModuleCall::HostResult(Err(message)) => Err(Error::Endpoint(message)),
-                _ => Err(Error::Endpoint(
-                    "expected HostResult answering a HostCall".to_string(),
-                )),
-            }
+            answer_from(read_frame::<_, ModuleCall>(&mut stream).map_err(io_err)?)
         }
     }
 }
@@ -1954,16 +2307,27 @@ pub struct ModuleSpace {
     aliases: ModuleAliases,
     /// The host's authority declaration for this mount — see [`ModuleFloor`].
     floor: ModuleFloor,
-    /// Concrete endpoint IRIs the host declares a card for, so `Meta` under this mount
-    /// answers something better than "module" and a *refinement* of the floor has somewhere
-    /// to live. Host data, exactly as in [`WasmModuleSpace`]: the module's own card is fine
-    /// for the catalog, never as the source of an enforced requirement.
+    /// Patterns the host declares a card for — the host's word about an endpoint, and the
+    /// place a *refinement* of the floor lives. Host data, exactly as in
+    /// [`WasmModuleSpace`]; a host card wins over the module's own card for the same
+    /// pattern, and the floor is folded into both, so neither can lower the mount.
     endpoints: Vec<(String, Description)>,
+    /// The module's own cards, asked for once at [`connect`](Self::connect) and held here so
+    /// the synchronous `resolve` can hand the kernel the module's self-description for an
+    /// IRI the host declared nothing for. Empty for a mount made with [`new`](Self::new),
+    /// which never asks. Only patterns under the mount's prefixes are kept: the host lists
+    /// what it routes.
+    cards: Vec<ModuleCard>,
+    /// The card for an IRI under the prefixes that no host card and no module card matches
+    /// ([`describing`](Self::describing)); a bare `"module"` unless the host says better.
+    describe: Description,
 }
 
 impl ModuleSpace {
     /// Route every IRI starting with one of `prefixes` to `transport`, **without asking
-    /// the module how it names things**.
+    /// the module anything** — neither how it names things nor what its endpoints are (so
+    /// an IRI the host declares no card for describes itself with the generic card; see
+    /// [`describing`](Self::describing) and [`connect`](Self::connect)).
     ///
     /// Correct for the overwhelmingly common module, which resolves every target under the
     /// name it was given. For a module that composes a rewriting space, prefer
@@ -1985,11 +2349,15 @@ impl ModuleSpace {
             aliases: ModuleAliases::unknown(),
             floor,
             endpoints: Vec::new(),
+            cards: Vec::new(),
+            describe: Description::new("module"),
         }
     }
 
     /// Ask the module for its [`ModuleManifest`] and install the canonicalization it
-    /// declares — the mount-time round trip that lets a module compose a rewriting space.
+    /// declares — the mount-time round trip that lets a module compose a rewriting space —
+    /// and for its [`ModuleCard`]s, installed beside the host's own so the module's
+    /// endpoints describe themselves through the mount exactly as they would linked.
     ///
     /// This is the one place the module is asked, and it is asked **once**: from here on
     /// the rewrite is applied by the host, synchronously, inside `Space::resolve`, and
@@ -2009,13 +2377,36 @@ impl ModuleSpace {
         let prefixes: Vec<String> = prefixes.into_iter().map(Into::into).collect();
         let manifest = transport.manifest().await?;
         let aliases = ModuleAliases::install(&prefixes, manifest.rewrite)?;
+        // The module's cards, kept only for the patterns this mount routes: a card for a
+        // name the host never routed here would list an IRI the mount cannot serve.
+        let cards = transport
+            .cards()
+            .await?
+            .into_iter()
+            .filter(|card| {
+                prefixes
+                    .iter()
+                    .any(|p| card.entry.pattern.starts_with(p.as_str()))
+            })
+            .collect();
         Ok(Self {
             prefixes,
             transport,
             aliases,
             floor,
             endpoints: Vec::new(),
+            cards,
+            describe: Description::new("module"),
         })
+    }
+
+    /// The card for an IRI under the prefixes that nothing else describes (builder): what
+    /// `Meta` answers for a name the host never enumerated and the module never listed.
+    /// Default `Description::new("module")`. Display only — the floor is folded in either
+    /// way, so this can never be an authority fallback.
+    pub fn describing(mut self, describe: Description) -> Self {
+        self.describe = describe;
+        self
     }
 
     /// Install a declaration the host already holds, without asking (builder). Same
@@ -2045,17 +2436,43 @@ impl ModuleSpace {
         self
     }
 
-    /// The card to hand the resolved endpoint for `target`, with the mount's floor folded
-    /// in. Falls back to the bare `"module"` card for an IRI the host declared nothing for —
-    /// which is a *display* fallback only, never an authority one.
-    fn card_for(&self, target: &str) -> Description {
-        let card = self
+    /// Whether `pattern` is under one of the mount's prefixes — what this mount routes.
+    fn routes(&self, pattern: &str) -> bool {
+        self.prefixes
+            .iter()
+            .any(|p| pattern.starts_with(p.as_str()))
+    }
+
+    /// The host-declared card matching `target`, if any — an exact IRI or a template.
+    fn host_card(&self, target: &Iri) -> Option<&Description> {
+        match_card(
+            self.endpoints
+                .iter()
+                .map(|(pattern, card)| (pattern.as_str(), card.id.as_str(), card)),
+            target,
+        )
+        .map(|(_, card)| card)
+    }
+
+    /// The name and card to hand the resolved endpoint for `target`, the mount's floor
+    /// folded into the card: the host's card if it declared one, else the module's own
+    /// (asked at `connect`), else the generic card — a *display* fallback only, never an
+    /// authority one, since the floor applies to all three.
+    fn card_for(&self, target: &Iri) -> (String, Description) {
+        let host = self
             .endpoints
             .iter()
-            .find(|(iri, _)| iri == target)
-            .map(|(_, d)| d.clone())
-            .unwrap_or_else(|| Description::new("module"));
-        self.floor.applied_to(card)
+            .map(|(pattern, card)| (pattern.as_str(), card.id.as_str(), card));
+        let module = self.cards.iter().map(|card| {
+            (
+                card.entry.pattern.as_str(),
+                card.entry.endpoint.as_str(),
+                &card.description,
+            )
+        });
+        let (name, card) =
+            match_card(host.chain(module), target).unwrap_or(("module", &self.describe));
+        (name.to_string(), self.floor.applied_to(card.clone()))
     }
 
     /// What the module said about how it names things.
@@ -2071,8 +2488,7 @@ impl ModuleSpace {
 
 impl Space for ModuleSpace {
     fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
-        let target = request.target.as_str();
-        if !self.prefixes.iter().any(|p| target.starts_with(p.as_str())) {
+        if !self.routes(request.target.as_str()) && self.host_card(&request.target).is_none() {
             return Resolution::Miss;
         }
         // ★ The module's declared rewrite, applied HERE — host-side, synchronously, by the
@@ -2089,10 +2505,12 @@ impl Space for ModuleSpace {
             }
         };
         // (A real host also *triggers lazy instantiation* of the module here.)
+        let (name, describe) = self.card_for(&request.target);
         Resolution::Hit(Resolved {
             endpoint: Arc::new(ModuleEndpoint {
                 transport: Arc::clone(&self.transport),
-                describe: self.card_for(target),
+                name,
+                describe,
                 floor: self.floor.clone(),
             }),
             bindings: Bindings::new(),
@@ -2100,8 +2518,31 @@ impl Space for ModuleSpace {
         })
     }
 
+    /// ★ Who enumerates: **the host lists every pattern it holds a card for, then whatever
+    /// the module says it binds under the routed prefixes.** Host cards first (they win
+    /// resolution too), then the module's cards from `connect`, then the transport's live
+    /// answer for a mount that never asked — each pattern once. [`WasmModuleSpace`] follows
+    /// the same rule and simply holds no module cards, because asking a lazy module means
+    /// loading it: the two spaces differ in what they can KNOW, not in the rule.
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        self.transport.entries()
+        let mut entries: Vec<SpaceEntry> = self
+            .endpoints
+            .iter()
+            .map(|(pattern, card)| SpaceEntry::new(pattern.clone(), card.id.clone()))
+            .collect();
+        let listed =
+            |entries: &[SpaceEntry], pattern: &str| entries.iter().any(|e| e.pattern == pattern);
+        for card in &self.cards {
+            if !listed(&entries, &card.entry.pattern) {
+                entries.push(card.entry.clone());
+            }
+        }
+        for entry in self.transport.entries().unwrap_or_default() {
+            if self.routes(&entry.pattern) && !listed(&entries, &entry.pattern) {
+                entries.push(entry);
+            }
+        }
+        (!entries.is_empty()).then_some(entries)
     }
 }
 
@@ -2111,6 +2552,10 @@ impl Space for ModuleSpace {
 /// serves the callbacks from its cache (cacheability composes across the boundary).
 struct ModuleEndpoint {
     transport: Arc<dyn ModuleTransport>,
+    /// The bound endpoint's name as the card's source knows it — the module's for a module
+    /// card, the description id for a host card, `"module"` for the generic one — so a
+    /// template entry's probe (core's `describe_entry` guard) recognizes what it reached.
+    name: String,
     describe: Description,
     floor: ModuleFloor,
 }
@@ -2136,7 +2581,7 @@ impl Endpoint for ModuleEndpoint {
     }
 
     fn name(&self) -> &str {
-        "module"
+        &self.name
     }
 
     fn describe(&self) -> Description {
@@ -2478,12 +2923,18 @@ mod tests {
         };
 
         let reply_bytes = block_on(run_session(&module, &invoke, host_call));
-        match decode::<ModuleReply>(&reply_bytes).unwrap() {
-            ModuleReply::Resolved(rep) => {
-                assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module")
-            }
-            other => panic!("expected Resolved, got {other:?}"),
-        }
+        let rep = outcome_from(decode::<ModuleReply>(&reply_bytes).unwrap())
+            .expect("the session resolved");
+        assert_eq!(
+            String::from_utf8(rep.bytes.clone()).unwrap(),
+            "hello, module"
+        );
+        // The stub declares a thread under its own name; the closure pump carries it
+        // (`ResolvedThreaded`) and the host re-attaches it.
+        assert_eq!(
+            rep.threads().iter().cloned().collect::<Vec<_>>(),
+            [Thread::new("urn:stub:concat")]
+        );
     }
 
     // --- WasmModuleSpace + serve_host_call: the browser's split, exercised on native ----
@@ -2506,11 +2957,7 @@ mod tests {
                 async move {
                     Ok(serve_host_call(&reply, |request, capability| {
                         let host = Arc::clone(&host);
-                        async move {
-                            host.issue(request, &capability)
-                                .await
-                                .map_err(|e| e.to_string())
-                        }
+                        async move { host.issue(request, &capability).await }
                     })
                     .await)
                 }
@@ -2894,32 +3341,38 @@ mod tests {
         // relies on: the thread the module's endpoint DECLARED is the backing name, so a
         // cut naming the backing resource invalidates what the logical name cached.
         //
-        // ⚠ In-process only, and not because of anything in this arc: a module's
-        // `Representation::threads` is `serde(skip)`, so a wire transport drops the
-        // module's own declared threads entirely and invalidation over the wire rides on
-        // the host callbacks' provenance instead. Worth knowing before a module is written
-        // that declares a thread nothing else touches.
+        // In-process AND through the codec. `Representation::threads` is `serde(skip)`, so
+        // through 0.2 a wire transport dropped the module's own declared threads and this
+        // held in-process only; `ModuleReply::ResolvedThreaded` carries them now.
         let table = join_table();
-        let transport = Arc::new(
-            InProcessTransport::from_arc(aliasing_module(&table))
-                .declaring(ModuleRewrite::from_table(&table)),
-        );
-        let kernel = kernel_with(declared_module(transport));
-        let cap = Capability::root();
-        block_on(kernel.issue(join_request(), &cap)).expect("aliased module invoke");
-        assert!(kernel.is_cached(&concat_request(), &cap));
+        let transports: [Arc<dyn ModuleTransport>; 2] = [
+            Arc::new(
+                InProcessTransport::from_arc(aliasing_module(&table))
+                    .declaring(ModuleRewrite::from_table(&table)),
+            ),
+            Arc::new(
+                LoopbackTransport::from_arc(aliasing_module(&table))
+                    .declaring(ModuleRewrite::from_table(&table)),
+            ),
+        ];
+        for transport in transports {
+            let kernel = kernel_with(declared_module(transport));
+            let cap = Capability::root();
+            block_on(kernel.issue(join_request(), &cap)).expect("aliased module invoke");
+            assert!(kernel.is_cached(&concat_request(), &cap));
 
-        // The logical name is NOT the thread — nothing was ever filed under it.
-        kernel.cut("urn:stub:join");
-        assert!(
-            kernel.is_cached(&concat_request(), &cap),
-            "cutting the logical name touches nothing, because the resource is the backing one"
-        );
-        kernel.cut("urn:stub:concat");
-        assert!(
-            !kernel.is_cached(&concat_request(), &cap),
-            "the module declared its thread under the backing name"
-        );
+            // The logical name is NOT the thread — nothing was ever filed under it.
+            kernel.cut("urn:stub:join");
+            assert!(
+                kernel.is_cached(&concat_request(), &cap),
+                "cutting the logical name touches nothing: the resource is the backing one"
+            );
+            kernel.cut("urn:stub:concat");
+            assert!(
+                !kernel.is_cached(&concat_request(), &cap),
+                "the module declared its thread under the backing name"
+            );
+        }
     }
 
     #[test]
@@ -3121,6 +3574,28 @@ mod tests {
         // message.
         assert_eq!(encode(&ModuleCall::Describe).unwrap(), vec![2]);
         assert_eq!(encode(&ModuleCall::Manifest).unwrap(), vec![3]);
+        // 0.3 appended, in this order: `HostError` = 4 and `Cards` = 5 on the call side;
+        // `ErrorTyped` = 5, `ResolvedThreaded` = 6 and `Cards` = 7 on the reply side. And
+        // `ModuleError`'s variants sit where `WireError`'s do (`Denied` = 4).
+        assert_eq!(
+            encode(&ModuleCall::HostError(ModuleError::Denied("x".into()))).unwrap()[..2],
+            [4, 4]
+        );
+        assert_eq!(encode(&ModuleCall::Cards).unwrap(), vec![5]);
+        assert_eq!(
+            encode(&ModuleReply::ErrorTyped(ModuleError::Denied("x".into()))).unwrap()[..2],
+            [5, 4]
+        );
+        let empty = Representation::new(ReprType::new("text/plain"), Vec::new());
+        assert_eq!(
+            encode(&ModuleReply::ResolvedThreaded {
+                representation: empty,
+                threads: Vec::new(),
+            })
+            .unwrap()[0],
+            6
+        );
+        assert_eq!(encode(&ModuleReply::Cards(Vec::new())).unwrap(), vec![7, 0]);
         assert_eq!(encode(&ModuleReply::Bindings(None)).unwrap(), vec![3, 0]);
         assert_eq!(
             encode(&ModuleReply::Manifest(ModuleManifest::unknown(None)))
@@ -3138,6 +3613,106 @@ mod tests {
             decode::<ModuleReply>(&[3, 0]).unwrap(),
             ModuleReply::Bindings(None)
         ));
+    }
+
+    #[test]
+    fn card_survives_the_codec() {
+        // `Description` derives serde for JSON — `skip_serializing_if` on its optional
+        // fields — and postcard is not self-describing, so a card cannot ride the frame as
+        // a struct: a skipped field reads as "end of buffer" on the way back. It crosses as
+        // JSON text inside the frame instead, and comes back whole: typed inputs, a default,
+        // per-verb actions, `requires`, a template entry.
+        let card = ModuleCard {
+            entry: SpaceEntry::new("urn:demo:thing:{id}", "thing"),
+            description: Description::new("thing")
+                .title("A thing")
+                .input(ArgSpec::new("id").binding().class(XSD_STRING))
+                .action(
+                    ActionSpec::new(Verb::Source)
+                        .input(
+                            ArgSpec::new("as")
+                                .one_of(["text/plain", "text/turtle"])
+                                .default_value("text/plain"),
+                        )
+                        .output("text/plain")
+                        .output("text/turtle"),
+                )
+                .action(
+                    ActionSpec::new(Verb::Sink)
+                        .input(ArgSpec::new("content").class(XSD_STRING))
+                        .requires("urn:cap:demo:write"),
+                ),
+        };
+        let bytes = encode(&ModuleReply::Cards(vec![card.clone()])).unwrap();
+        match decode::<ModuleReply>(&bytes).unwrap() {
+            ModuleReply::Cards(cards) => assert_eq!(cards, [card]),
+            other => panic!("expected Cards, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_installs_the_modules_cards_through_the_codec() {
+        // The module's own `describe()` reaches the kernel through a `connect`ed mount —
+        // over the loopback, so the cards crossed as bytes — for an exact and for a template
+        // binding, and the catalog lists what the module binds. `new` asks nothing and
+        // answers the generic card.
+        let module: Arc<dyn Space> = Arc::new(
+            gated_module().bind(
+                UriTemplate::parse("urn:stub:echo:{word}").unwrap(),
+                FnEndpoint::new("stub-echo", |inv: &Invocation<'_>| {
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        inv.bindings.get("word").unwrap_or("").as_bytes().to_vec(),
+                    ))
+                })
+                .with_description(
+                    Description::new("stub-echo")
+                        .verb(Verb::Source)
+                        .input(ArgSpec::new("word").binding().class(XSD_STRING)),
+                ),
+            ),
+        );
+        let asked = block_on(ModuleSpace::connect(
+            ["urn:stub:"],
+            Arc::new(LoopbackTransport::from_arc(Arc::clone(&module))),
+            ModuleFloor::public(),
+        ))
+        .unwrap();
+        let kernel = kernel_over(asked);
+        assert_eq!(
+            kernel.describe_pattern("urn:stub:greet").unwrap(),
+            GreetEndpoint.describe(),
+            "an exact binding's card is the module's"
+        );
+        let echo = kernel.describe_pattern("urn:stub:echo:{word}").unwrap();
+        assert_eq!(
+            echo.id, "stub-echo",
+            "a template binding's card is found by matching"
+        );
+        assert_eq!(
+            kernel
+                .entries()
+                .unwrap()
+                .iter()
+                .filter(|e| e.pattern.starts_with("urn:stub:"))
+                .map(|e| e.pattern.as_str())
+                .collect::<Vec<_>>(),
+            ["urn:stub:greet", "urn:stub:echo:{word}"]
+        );
+        // And the kernel enforces what the card declares, host-side, before the wire.
+        let denial =
+            block_on(kernel.issue(greet_request(), &Capability::scoped([READ]))).unwrap_err();
+        assert!(matches!(denial, Error::Denied(_)), "{denial:?}");
+
+        let unasked = kernel_over(ModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(LoopbackTransport::from_arc(module)),
+            ModuleFloor::public(),
+        ));
+        assert_eq!(
+            unasked.describe_pattern("urn:stub:greet").unwrap().id,
+            "module"
+        );
     }
 
     #[test]
@@ -3186,6 +3761,8 @@ mod tests {
     // The pair matters: without the positive case a test suite passes by denying
     // everything, and without the floor a module declaring nothing would be ungated.
     // -----------------------------------------------------------------------------------
+
+    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
     /// The scope the gated stub declares, and one that is not it.
     const GREET: &str = "urn:cap:demo:greet";
@@ -3277,10 +3854,11 @@ mod tests {
 
     #[test]
     fn the_serialized_session_enforces_the_declaration_too() {
-        // Through the codec, so the guard is not an artifact of the direct-call transport.
-        // ⚠ The refusal arrives as `Error::Endpoint`, not `Error::Denied`: `ModuleReply::Error`
-        // carries a string, so the error TYPE does not survive the wire. Pinned rather than
-        // wished away — it is a real gap in the module protocol.
+        // Through the codec, so the guard is not an artifact of the direct-call transport —
+        // and through `ModuleSpace::new`, so no card reaches the kernel and the refusal is
+        // the MODULE side's, crossing the wire. Through 0.2 it arrived as `Error::Endpoint`
+        // (`ModuleReply::Error` carried a string); `ModuleReply::ErrorTyped` keeps it a
+        // permanent `Denied`.
         let kernel = kernel_over(ModuleSpace::new(
             ["urn:stub:"],
             Arc::new(LoopbackTransport::new(gated_module())),
@@ -3288,6 +3866,11 @@ mod tests {
         ));
         let denial = block_on(kernel.issue(greet_request(), &Capability::scoped([READ])))
             .expect_err("the module's declaration is enforced over the session too");
+        assert!(matches!(denial, Error::Denied(_)), "{denial:?}");
+        assert!(
+            !denial.is_transient(),
+            "a refusal that crossed the wire is still permanent: {denial:?}"
+        );
         assert!(denial.to_string().contains(GREET), "{denial}");
         assert_eq!(
             block_on(kernel.issue(greet_request(), &Capability::scoped([GREET])))
