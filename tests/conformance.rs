@@ -43,7 +43,9 @@
 //! - **A mount that never asked sees nothing of the module**
 //!   ([`a_mount_that_never_asked_describes_one_endpoint_named_module`]): through
 //!   `ModuleSpace::new` the manifold is one endpoint, `module`, with no actions — the
-//!   0.2 state, kept as the documented cost of not asking.
+//!   0.2 state, kept as the documented cost of not asking. That cost is also counted:
+//!   run the module's own suite over that mount and all seven of its statements about the
+//!   module report inert, because there is no `cell` and no `join` to hold them to.
 //! - **The floor is visible AND enforced** ([`the_floor_is_visible_and_enforced`]): under
 //!   `ModuleFloor::requiring(..)` every module action's card carries the scope, the walk is
 //!   clean (ENFORCED sees the floor's typed `Denied`), and the module's own `requires`
@@ -65,10 +67,20 @@
 //!   composes an `Alias` and declares its table gives the logical and backing names ONE cache
 //!   entry through every mount — the declaration crosses (or is written host-side for the
 //!   lazy space), the kernel adopts the backing name before it keys anything.
+//!
+//! ## One suite per manifold, not one per file
+//!
+//! A `Suite`'s declarations name `Description::id`s, so a suite is a statement about the
+//! MANIFOLD it walks, not about the module in the abstract. Every mount that asks presents
+//! the same manifold as bare, so they share [`suite`]; a mount that never asked presents a
+//! different one, and gets [`host_suite`] — the half no mount can change. Conformance 0.2's
+//! `DECLARATIONS` is what makes the difference enforceable rather than a convention: through
+//! 0.1 the wrong suite still printed `declared cacheable: cell` and nothing said the check
+//! had not run.
 
 use async_trait::async_trait;
 use futures::executor::block_on;
-use ikigai_conformance::{Check, Fixture, Report, Suite};
+use ikigai_conformance::{Check, Finding, Fixture, Report, Suite};
 use ikigai_core::{
     ActionSpec, Alias, AliasTable, ArgRef, ArgSpec, Capability, Description, Endpoint,
     EndpointSpace, Error, Exact, Expiry, Fallback, FnEndpoint, Invocation, Iri, Kernel, ReprType,
@@ -78,6 +90,7 @@ use ikigai_module::{
     run_session, serve_host_call, InProcessTransport, LoopbackTransport, ModuleFloor,
     ModuleRewrite, ModuleSessionTransport, ModuleSpace, WasmModuleSpace,
 };
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -451,8 +464,21 @@ fn mounted() -> impl Iterator<Item = (&'static str, Mount)> {
     mounts().into_iter().filter(|(label, _)| *label != "bare")
 }
 
+/// The HOST's own declarations — the two resources `join` reaches back for. These are
+/// true of every walk in this file: no mount touches the host's space, so `greeting` and
+/// `subject` are in the manifold however the module arrived.
+fn host_suite() -> Suite {
+    Suite::new().cacheable("greeting").cacheable("subject")
+}
+
+/// The host's declarations plus the MODULE's own. Every line added here names a
+/// `Description::id` that exists in the manifold only when the module's cards CROSSED the
+/// mount — `connect` asks, `WasmModuleSpace::with_endpoint` is told. Through a mount that
+/// never asked there is no `cell` and no `join` to hold to anything, so this is not that
+/// mount's suite: see [`a_mount_that_never_asked_describes_one_endpoint_named_module`],
+/// which runs it there on purpose and asserts that every line below reports inert.
 fn suite() -> Suite {
-    Suite::new()
+    host_suite()
         .fixture(
             Fixture::new("join", Verb::Source)
                 .arg("a", "urn:test:greeting")
@@ -462,8 +488,6 @@ fn suite() -> Suite {
         .cacheable("upper")
         .cacheable("echo")
         .cacheable("join")
-        .cacheable("greeting")
-        .cacheable("subject")
         .pure("upper")
         .pure("echo")
 }
@@ -521,7 +545,7 @@ fn assert_shape(label: &str, report: &Report) {
     assert!(report.declared.opted_out.is_empty(), "{label}: {report}");
     assert_eq!(
         report.declared.cacheable,
-        ["cell", "upper", "echo", "join", "greeting", "subject"],
+        ["greeting", "subject", "cell", "upper", "echo", "join"],
         "{label}"
     );
     assert_eq!(report.declared.pure, ["upper", "echo"], "{label}");
@@ -576,6 +600,11 @@ fn conforms() {
 /// ONE endpoint, `module`, with no actions — every catalog row describes itself with the
 /// generic card, and the suite's one finding says so. This is the 0.2 state, kept as the
 /// documented cost of not asking; `connect` is the mount that asks.
+///
+/// The suite run here is [`host_suite`], not [`suite`]: a suite states what the manifold it
+/// walks holds, and through this mount the manifold holds the host's two resources and a
+/// nameless `module`. The second half of the test runs the module's own [`suite`] anyway,
+/// to put a number on what not asking costs.
 #[test]
 fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
     let leaf = Leaf::new();
@@ -585,7 +614,7 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
         ModuleFloor::public(),
     );
     let kernel = Kernel::new(root(host_space(), Arc::new(unasked)));
-    let report = suite().run_blocking(&kernel);
+    let report = host_suite().run_blocking(&kernel);
     eprintln!("unasked: {report}");
     // The module's rows are still listed (the transport enumerates)…
     assert_eq!(
@@ -607,6 +636,37 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
     );
     assert_eq!(findings[1].endpoint, "echo");
     assert!(findings[1].detail.contains("describes nothing"), "{report}");
+
+    // What not asking costs, counted: hand this mount the suite every other mount passes
+    // clean and EVERY statement it makes about the module goes inert — four `cacheable`,
+    // two `pure` and the `join` fixture, each for the one structural reason that there is
+    // no endpoint by that id to hold. The host's own two declarations are untouched: a
+    // mount cannot reach them. DECLARATIONS is what says so; through conformance 0.1 all
+    // seven were printed under `declared cacheable:` as though a check had consulted them.
+    let report = suite().run_blocking(&kernel);
+    eprintln!("unasked, under the module's own suite: {report}");
+    let inert: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.check == Check::Declarations)
+        .collect();
+    assert_eq!(
+        inert.len(),
+        7,
+        "every module declaration is inert: {report}"
+    );
+    assert!(
+        inert.iter().all(|f| f
+            .detail
+            .contains("the walk reached no endpoint with that id")),
+        "{report}"
+    );
+    let ids: BTreeSet<&str> = inert.iter().map(|f| f.endpoint.as_str()).collect();
+    assert_eq!(
+        ids,
+        BTreeSet::from(["cell", "upper", "echo", "join"]),
+        "the module's ids, and only those: {report}"
+    );
 
     // The generic card is the host's to write.
     let described = ModuleSpace::new(

@@ -169,6 +169,17 @@ preserved in both directions, the module's declared canonical adopted by the hos
 clean. The one state it cannot hold is a mount made with `new`, which is pinned as what it is:
 one endpoint named `module`, with no actions.
 
+A suite's declarations name `Description::id`s, so **a suite is a statement about the manifold
+it walks**, not about the module in the abstract. Every mount that asks for the module's cards
+presents the same manifold as bare, so they share one suite; a mount made with `new` presents a
+different one — nothing of the module is named in it — and gets the half of the suite no mount
+can change, the host's own resources. The conformance suite's `DECLARATIONS` check is what
+makes that distinction enforceable rather than a convention: it reports a declaration that no
+check could have consulted, so running the wrong suite over the wrong mount is a finding
+instead of a line in the report that merely *reads* as a check that ran. The cost of not asking
+is counted the same way — the module's own suite run over a `new` mount reports all seven of
+its statements inert.
+
 ## Composing a rewriting space in a module
 
 Any space should be composable in any module, including one that resolves one name under
