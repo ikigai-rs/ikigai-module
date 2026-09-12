@@ -58,6 +58,13 @@ libc = "0.2"
 # The module recipe as one test, across the boundary (`tests/conformance.rs`): one fixture
 # module walked bare and through every mount, every report held to the bare one —
 # identical catalog and descriptions, cacheability by thread name, every error type
-# preserved in both directions. 0.1.0 pulls ikigai-core 0.1.67, which the caret above
+# preserved in both directions. 0.2.0 pulls ikigai-core 0.1.69, which the caret above
 # admits; the library itself needs nothing past its own pin.
-ikigai-conformance = "0.1.0"
+#
+# 0.2.0 = `Check::Declarations`, which is why the floor moved: it reports a declaration no
+# check consulted, and this crate's walk is the case it was written for. One suite was being
+# run over two different manifolds — the mounts that ask the module for its cards, and
+# `ModuleSpace::new`, which never asks — so through the latter every statement about a module
+# endpoint named an id the walk could not reach, and the report printed them anyway. The fix
+# is one suite per manifold, not a version floor; the pin is what surfaced it.
+ikigai-conformance = "0.2.0"
