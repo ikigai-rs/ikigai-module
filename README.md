@@ -236,19 +236,23 @@ A declared table is also validated at mount time: it must parse, and every rule 
 inside the prefixes the host routed to the module. A module may only canonicalize names it
 was given.
 
-## Phasing
+## Transports: one exists, one is designed for
 
-- **Phase 1 (today)** — `InProcessTransport`: the module runs in the same process and
-  the "transport" is a direct call, proving the callback machinery without any wire risk.
-- **Phase 2** — a serialized `ModuleTransport` (a second wasm instance, an embedded
-  wasmtime, or a socket) that marshals `ModuleCall` / `ModuleReply` as postcard bytes
-  and services the module's callbacks with `host.issue(..)`. Swapping it in touches
-  neither the module's code nor `ModuleSpace`.
+- **In the same process, today** — `InProcessTransport`: the module runs in the host's
+  own process and the "transport" is a direct call, proving the callback machinery
+  without any wire risk. This is the only transport this crate ships.
+- **Across a boundary, not built** — a serialized `ModuleTransport` (a second wasm
+  instance, an embedded wasmtime, or a socket) that marshals `ModuleCall` /
+  `ModuleReply` as postcard bytes and services the module's callbacks with
+  `host.issue(..)`. The seam exists so that swapping one in touches neither the
+  module's code nor `ModuleSpace`; nothing implements it yet.
 
 The first real artifact built on this format is
 [`ikigai-xslt-module`](https://github.com/ikigai-rs/ikigai-xslt-module).
 
-See `ikigai-cli/docs/module-format-design.md` for the full design.
+The full design is
+[`docs/module-format-design.md`](https://github.com/ikigai-rs/ikigai-cli/blob/main/docs/module-format-design.md)
+in `ikigai-cli`.
 
 ## License
 
