@@ -16,7 +16,13 @@ name = "ikigai-module"
 # omitted would be the hole this closes). Behavior-breaking — a module endpoint's declared
 # `requires` is now ENFORCED across the boundary, so a caller that used to reach an
 # under-capability'd module endpoint is now correctly denied.)
-version = "0.3.0"
+#
+# 0.3.1: no API change. Both `Space::resolve` impls build `Resolved` through its
+# constructor instead of a struct literal, so the crate compiles against core 0.1.78
+# (which adds `Resolved.answered_by`) as well as every earlier core the pin admits.
+# Published BEFORE core 0.1.78 on purpose: this crate commits no lockfile, and 0.3.0 on
+# crates.io stops compiling for every lockless consumer the moment 0.1.78 is published.
+version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -26,11 +32,19 @@ homepage = "https://github.com/ikigai-rs/ikigai-module"
 keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 
 [dependencies]
-# 0.1.64 = `Resolved.canonical` (the alias/rewrite-reporting field). The pin states the
-# true minimum: both `Space::resolve` impls below build a `Resolved` literal, which does
-# not compile before that field exists. The earlier floor was 0.1.46 = `SpaceEntry::new`
-# (the federated-catalog `origin` field made THAT struct literal a break) — the same event,
-# twice. Both times the break is what surfaced the sites, so the literals stay literals.
+# 0.1.64 = `Resolved.canonical` (the alias/rewrite-reporting field) with `Resolved::new`
+# and `Resolved::with_canonical`, which both `Space::resolve` impls below use to report the
+# module's declared rewrite. The pin states the true minimum API this crate CALLS — not the
+# newest field `Resolved` has. ⚠ Read the caret as a range: it admits every later 0.1.x,
+# and this crate commits no lockfile, so CI and every consumer's fresh resolve take the
+# newest core on crates.io. Both impls used to build a `Resolved` struct literal on
+# purpose, so the next field would break the site and force a re-read of the
+# `canonical: None` claim; the earlier floor, 0.1.46 = `SpaceEntry::new`, came from the
+# same choice when the federated-catalog `origin` field broke THAT literal. The third
+# time (core 0.1.78, `Resolved.answered_by`) the break landed where a lockless published
+# crate breaks: in CI and on crates.io for every consumer, fixable only by a release. The
+# constructor compiles against every core the caret admits, and the pin does NOT move for
+# 0.1.78 because nothing here needs it.
 # 0.1.64 is also the floor for the rest of the rewrite story a module now declares:
 # `AliasTable::{parse, to_text}` (the declaration's text form on the wire), `AliasRule`'s
 # accessors (mount-time validation) and `Canonical` — plus, decisively, the kernel ADOPTING
