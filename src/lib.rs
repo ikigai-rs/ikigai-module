@@ -1834,9 +1834,15 @@ impl Space for WasmModuleSpace {
             return Resolution::Miss;
         }
         // The canonical this space reports is the module's DECLARED rewrite, applied
-        // host-side. `None` when nothing was declared — a claim, not a default, which is
-        // why this stays a struct literal rather than `Resolved::new`: the next field
-        // `Resolved` grows breaks this site on purpose, so the claim gets re-read.
+        // host-side. `None` when nothing was declared — a claim, not a default. This used
+        // to be a struct literal ON PURPOSE, so the next field `Resolved` grew would break
+        // the site and force that claim to be re-read. The next field came (core 0.1.78,
+        // `answered_by`), and what it broke was not this file but the PUBLISHED crate, for
+        // every consumer resolving without a lockfile, until a release carried the fix — a
+        // review trigger that taxes the whole ecosystem's release order. So: the
+        // constructor, which compiles against every core the caret admits; the claim lives
+        // in the `None` arm below; a field this site has no opinion on (`answered_by`)
+        // takes core's default, which is the honest statement.
         let canonical = match self.aliases.route(&request.target) {
             Routing::Direct => None,
             Routing::Canonical(iri) => Some(iri),
@@ -1844,14 +1850,17 @@ impl Space for WasmModuleSpace {
                 return Resolution::Hit(Resolved::new(refusing_endpoint(message), Bindings::new()))
             }
         };
-        Resolution::Hit(Resolved {
-            endpoint: Arc::new(WasmModuleEndpoint {
+        let resolved = Resolved::new(
+            Arc::new(WasmModuleEndpoint {
                 transport: Arc::clone(&self.transport),
                 describe: self.card_for(&request.target),
                 floor: self.floor.clone(),
             }),
-            bindings: Bindings::new(),
-            canonical,
+            Bindings::new(),
+        );
+        Resolution::Hit(match canonical {
+            Some(iri) => resolved.with_canonical(iri),
+            None => resolved,
         })
     }
 
@@ -2495,8 +2504,10 @@ impl Space for ModuleSpace {
         // kernel's own `AliasTable`. The canonical rides back on the `Resolved` and the
         // kernel adopts it before it computes the request id, so the logical and backing
         // names are ONE cache entry and ONE golden thread across the module boundary.
-        // `None` when nothing was declared: a claim, not a default, which is why this stays
-        // a struct literal — the compile break IS the review trigger.
+        // `None` when nothing was declared: a claim, not a default. Built through the
+        // constructor, not a struct literal, for the reason stated at the wasm site above:
+        // the literal's compile break was meant as a review trigger and turned out to be a
+        // publish-order break for every lockless consumer of this crate (core 0.1.78).
         let canonical = match self.aliases.route(&request.target) {
             Routing::Direct => None,
             Routing::Canonical(iri) => Some(iri),
@@ -2506,15 +2517,18 @@ impl Space for ModuleSpace {
         };
         // (A real host also *triggers lazy instantiation* of the module here.)
         let (name, describe) = self.card_for(&request.target);
-        Resolution::Hit(Resolved {
-            endpoint: Arc::new(ModuleEndpoint {
+        let resolved = Resolved::new(
+            Arc::new(ModuleEndpoint {
                 transport: Arc::clone(&self.transport),
                 name,
                 describe,
                 floor: self.floor.clone(),
             }),
-            bindings: Bindings::new(),
-            canonical,
+            Bindings::new(),
+        );
+        Resolution::Hit(match canonical {
+            Some(iri) => resolved.with_canonical(iri),
+            None => resolved,
         })
     }
 

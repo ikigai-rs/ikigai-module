@@ -835,7 +835,19 @@ fn cacheability_is_inherited_by_thread_name() {
             let b = source(&kernel, iri, args).unwrap();
             assert_eq!(a.bytes, b.bytes, "{label}: {iri}");
             assert_eq!(a.expiry, Expiry::Never, "{label}: {iri}");
-            assert!(a.threads().is_empty(), "{label}: {iri} is pure, no thread");
+            // Pure means the endpoint DECLARED no thread and depended on nothing. Since
+            // core 0.1.73 (ledger #512, hole A) the kernel itself hangs every cacheable
+            // Source from its own canonical name, so the set is no longer empty: this
+            // crate commits no lockfile, and across the caret it is `{}` on 0.1.69–0.1.72
+            // and `{iri}` from 0.1.73 on. What stays pinned either way is the property
+            // that matters — no thread but the resource's own name. (Was `is_empty()`,
+            // which went red on every fresh resolve the morning 0.1.73 published while a
+            // local lock at 0.1.69 kept the gates green.)
+            assert!(
+                a.threads().iter().all(|t| *t == Thread::new(iri)),
+                "{label}: {iri} is pure — no thread but its own name: {:?}",
+                a.threads()
+            );
             assert!(
                 kernel.is_cached(&request(Verb::Source, iri, args), &root),
                 "{label}: {iri}"
