@@ -1654,6 +1654,34 @@ impl DepSink {
         self.threads
             .extend(representation.threads().iter().cloned());
     }
+
+    /// Record a host call that FAILED, by error class — the rule core applies to a failed
+    /// sub-request in `Invocation::issue` (0.1.73), so a module that swallows a host-call
+    /// failure and answers cacheable gets exactly the cacheability its inputs warrant:
+    ///
+    /// - `Unresolved`: a thread on the canonical name the kernel reports; `NotFound`: a
+    ///   thread on the name that was `requested` (it carries no IRI of its own). Whoever
+    ///   makes the resource appear — a `Sink`, a watcher — cuts the answer built on its
+    ///   absence.
+    /// - Every other error (`Denied`, `Endpoint`, `Timeout`, …): `Expiry::Always`. Nothing
+    ///   names what would make the failure go away, and not caching is never wrong.
+    ///
+    /// Not carried: what the failed resolution itself depended on before it failed (core's
+    /// `Dependencies`, ledger #611). `serve_host_call`'s resolver returns a plain `Result`,
+    /// so a `NotFound` from a COMPOSITE host resource hangs only from the requested name.
+    fn record_failure(&mut self, requested: &Iri, error: &Error) {
+        match error {
+            Error::Unresolved(canonical) => {
+                self.threads.insert(Thread::from(canonical.as_str()));
+            }
+            Error::NotFound(_) => {
+                self.threads.insert(Thread::from(requested.as_str()));
+            }
+            _ => {
+                self.expiry = Some(Expiry::Always);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -1687,9 +1715,13 @@ fn take_sink(id: u64) -> DepSink {
 
 /// Service one out-of-band `HostCall` for a module session: decode the host call, resolve
 /// the sub-request via `resolve` (the host kernel), record its provenance against every
-/// in-flight [`WasmModuleSpace`] invocation, and return the encoded answer — a `HostResult`
+/// in-flight [`WasmModuleSpace`] invocation, and return the encoded answer: a `HostResult`
 /// for a success, a `HostError` for a failure with its [`Error`] type intact (either is a
 /// decodable answer). The host's global `hostCall` export calls this.
+///
+/// A failure is recorded too, by the rule core applies to a failed sub-request: a miss
+/// (`Unresolved` / `NotFound`) hangs the module's answer from the missing name, so a `Sink`
+/// that creates it cuts the answer; any other error makes the answer uncacheable.
 pub async fn serve_host_call<F, Fut>(reply: &[u8], resolve: F) -> Vec<u8>
 where
     F: FnOnce(Request, Capability) -> Fut,
@@ -1700,14 +1732,19 @@ where
             request,
             capability,
         }) => {
+            let requested = request.target.clone();
             let result = resolve(request, capability).await;
-            if let Ok(representation) = &result {
-                DEP_SINKS.with(|sinks| {
-                    for (_, sink) in sinks.borrow().iter() {
-                        sink.borrow_mut().record(representation);
+            // A failure is provenance too, recorded as core records a failed sub-request:
+            // without it, a module that swallows the error and answers cacheable is cached
+            // with no edge on what was missing (ledger #530).
+            DEP_SINKS.with(|sinks| {
+                for (_, sink) in sinks.borrow().iter() {
+                    match &result {
+                        Ok(representation) => sink.borrow_mut().record(representation),
+                        Err(error) => sink.borrow_mut().record_failure(&requested, error),
                     }
-                });
-            }
+                }
+            });
             // Typed, so a module resolving a host resource that is denied or absent sees
             // `Denied` / `NotFound`, not an endpoint string (see `ModuleError`).
             host_answer(result)
@@ -2629,6 +2666,7 @@ mod tests {
         ActionSpec, Alias, ArgRef, ArgSpec, Description, EndpointSpace, Exact, Fallback, Kernel,
         MetaRenderer, ReprType, Rewrite, Verb,
     };
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
 
     // A tiny meta renderer so the test kernel can describe endpoints if asked.
@@ -3020,6 +3058,255 @@ mod tests {
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
         // The refs are permanently cacheable (no thread), so the folded result caches too.
         assert!(kernel.is_cached(&concat_request(), &Capability::root()));
+    }
+
+    // --- A FAILED out-of-band host call is a dependency too (ledger #530) -------------
+    //
+    // Core's rule since 0.1.73 (`Invocation::issue`): a failed sub-request is recorded by
+    // error class — `Unresolved` / `NotFound` hang the result from the missing name, every
+    // other error makes it uncacheable. The in-band transports inherit that through
+    // `inv.issue`; the out-of-band path records in `serve_host_call`, so it has to apply
+    // the same rule itself. These tests run one kernel that holds both the module and the
+    // host resources, so a `Sink` on the host side cuts the module's cached answer.
+
+    /// A host resource that does not exist until something is sunk into it: `Source` is
+    /// `NotFound` while empty, a cacheable read once written; `urn:data:broken` always
+    /// fails with an endpoint error.
+    struct MaybeCell {
+        value: Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl Endpoint for MaybeCell {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            match inv.request.verb {
+                Verb::Source => match self.value.lock().expect("cell").clone() {
+                    Some(value) => {
+                        Ok(Representation::new(ReprType::new("text/plain"), value).cacheable())
+                    }
+                    None => Err(Error::NotFound("nothing here yet".to_string())),
+                },
+                Verb::Sink => {
+                    *self.value.lock().expect("cell") = Some(inv.inline_arg("content")?.to_vec());
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        b"ok".to_vec(),
+                    ))
+                }
+                other => Err(Error::Endpoint(format!("cell: unsupported {other:?}"))),
+            }
+        }
+    }
+
+    /// The module endpoint under test: it resolves `ref=` back through the host and, when
+    /// that FAILS, swallows the error and answers a cacheable fallback — the shape hole B
+    /// is about. Counts its runs so a test can tell "served from cache" from "ran".
+    struct SwallowEndpoint {
+        runs: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl Endpoint for SwallowEndpoint {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let target = Iri::parse(inv.inline_str("ref")?)
+                .map_err(|e| Error::Endpoint(format!("bad ref: {e}")))?;
+            match inv.source(&target).await {
+                Ok(representation) => Ok(representation),
+                Err(_) => Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"fallback".to_vec(),
+                )
+                .cacheable()),
+            }
+        }
+
+        fn name(&self) -> &str {
+            "stub-swallow"
+        }
+    }
+
+    /// A transport whose host calls resolve against the SAME kernel that mounts the
+    /// module — set after construction, since the kernel owns the transport.
+    struct SameKernelTransport {
+        module: Arc<dyn Space>,
+        host: Arc<std::sync::OnceLock<std::sync::Weak<Kernel>>>,
+    }
+
+    #[async_trait]
+    impl ModuleSessionTransport for SameKernelTransport {
+        async fn invoke_session(&self, invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
+            let host = self
+                .host
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or("the host kernel is gone")?;
+            let host_call = move |reply: Vec<u8>| {
+                let host = Arc::clone(&host);
+                async move {
+                    Ok(serve_host_call(&reply, |request, capability| {
+                        let host = Arc::clone(&host);
+                        async move { host.issue(request, &capability).await }
+                    })
+                    .await)
+                }
+            };
+            Ok(run_session(&self.module, &invoke, host_call).await)
+        }
+    }
+
+    /// The swallowing module's `space()`.
+    fn swallow_module(runs: &Arc<AtomicU32>) -> Arc<dyn Space> {
+        Arc::new(EndpointSpace::new().bind(
+            Exact::new("urn:stub:swallow"),
+            SwallowEndpoint {
+                runs: Arc::clone(runs),
+            },
+        ))
+    }
+
+    /// The host resources: a `MaybeCell` at `urn:data:optional` and an always-failing
+    /// `urn:data:broken`. Nothing is bound at `urn:data:absent`.
+    fn swallow_resources() -> Arc<dyn Space> {
+        Arc::new(
+            EndpointSpace::new()
+                .bind(
+                    Exact::new("urn:data:optional"),
+                    MaybeCell {
+                        value: Mutex::new(None),
+                    },
+                )
+                .bind(
+                    Exact::new("urn:data:broken"),
+                    FnEndpoint::new("broken", |_: &Invocation<'_>| {
+                        Err(Error::Endpoint("always broken".to_string()))
+                    }),
+                ),
+        )
+    }
+
+    /// One kernel: the swallowing module over the out-of-band split, beside the host
+    /// resources it calls back for.
+    fn swallowing_kernel(runs: &Arc<AtomicU32>) -> Arc<Kernel> {
+        let host = Arc::new(std::sync::OnceLock::new());
+        let wasm = WasmModuleSpace::new(
+            ["urn:stub:"],
+            Arc::new(SameKernelTransport {
+                module: swallow_module(runs),
+                host: Arc::clone(&host),
+            }),
+            Description::new("stub-swallow"),
+            ModuleFloor::public(),
+        );
+        let kernel = Arc::new(Kernel::with_meta_renderer(
+            Arc::new(Fallback::new(vec![
+                swallow_resources(),
+                Arc::new(wasm) as Arc<dyn Space>,
+            ])),
+            Arc::new(PlainRenderer),
+        ));
+        host.set(Arc::downgrade(&kernel)).expect("set once");
+        kernel
+    }
+
+    fn swallow_request(target: &str) -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:stub:swallow").unwrap())
+            .with_arg("ref", ArgRef::Inline(target.as_bytes().to_vec()))
+    }
+
+    /// A swallowed `NotFound` is cached, and a `Sink` that creates the resource cuts it.
+    fn assert_a_sink_reaches_the_swallowed_miss(kernel: &Kernel, runs: &AtomicU32) {
+        let cap = Capability::root();
+        let req = || swallow_request("urn:data:optional");
+
+        let first = block_on(kernel.issue(req(), &cap)).expect("first read");
+        assert_eq!(first.bytes, b"fallback");
+        let again = block_on(kernel.issue(req(), &cap)).expect("second read");
+        assert_eq!(again.bytes, b"fallback");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the fallback is cached");
+
+        // A Sink creates the resource; the kernel cuts its thread, which the fallback
+        // must hang from — or it is served stale forever.
+        let sink = Request::new(Verb::Sink, Iri::parse("urn:data:optional").unwrap())
+            .with_arg("content", ArgRef::Inline(b"created".to_vec()));
+        block_on(kernel.issue(sink, &cap)).expect("sink");
+        assert!(
+            !kernel.is_cached(&req(), &cap),
+            "the Sink cut the fallback's thread"
+        );
+        let after = block_on(kernel.issue(req(), &cap)).expect("read after sink");
+        assert_eq!(after.bytes, b"created");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn an_out_of_band_not_found_hangs_the_answer_from_the_missing_name() {
+        let runs = Arc::new(AtomicU32::new(0));
+        assert_a_sink_reaches_the_swallowed_miss(&swallowing_kernel(&runs), &runs);
+    }
+
+    #[test]
+    fn the_in_band_transports_inherit_the_rule_from_core() {
+        // The in-band host loop resolves through `inv.issue`, so core records the failed
+        // sub-request itself (0.1.73) — which is what the `ikigai-core` floor states. Pinned
+        // here so the two halves of the module wire cannot drift apart.
+        for loopback in [false, true] {
+            let runs = Arc::new(AtomicU32::new(0));
+            let module = swallow_module(&runs);
+            let transport: Arc<dyn ModuleTransport> = if loopback {
+                Arc::new(LoopbackTransport::from_arc(module))
+            } else {
+                Arc::new(InProcessTransport::from_arc(module))
+            };
+            let kernel = Kernel::with_meta_renderer(
+                Arc::new(Fallback::new(vec![
+                    swallow_resources(),
+                    Arc::new(ModuleSpace::new(
+                        ["urn:stub:"],
+                        transport,
+                        ModuleFloor::public(),
+                    )) as Arc<dyn Space>,
+                ])),
+                Arc::new(PlainRenderer),
+            );
+            assert_a_sink_reaches_the_swallowed_miss(&kernel, &runs);
+        }
+    }
+
+    #[test]
+    fn an_out_of_band_unresolved_hangs_the_answer_from_the_canonical_name() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let kernel = swallowing_kernel(&runs);
+        let cap = Capability::root();
+        let req = || swallow_request("urn:data:absent");
+
+        let first = block_on(kernel.issue(req(), &cap)).expect("first read");
+        assert_eq!(first.bytes, b"fallback");
+        assert!(kernel.is_cached(&req(), &cap), "a miss is still cacheable");
+
+        // Whoever makes the name appear (a dynamic space, a watcher) cuts its thread.
+        kernel.cut("urn:data:absent");
+        assert!(
+            !kernel.is_cached(&req(), &cap),
+            "the fallback hung from the unresolved name"
+        );
+    }
+
+    #[test]
+    fn any_other_out_of_band_failure_makes_the_answer_uncacheable() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let kernel = swallowing_kernel(&runs);
+        let cap = Capability::root();
+        let req = || swallow_request("urn:data:broken");
+
+        let first = block_on(kernel.issue(req(), &cap)).expect("first read");
+        assert_eq!(first.bytes, b"fallback");
+        assert!(
+            !kernel.is_cached(&req(), &cap),
+            "nothing names what would clear an endpoint error, so the fallback is not cached"
+        );
+        block_on(kernel.issue(req(), &cap)).expect("second read");
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "every read runs the module");
     }
 
     #[test]
@@ -3912,11 +4199,13 @@ mod tests {
             .expect_err("the mount's floor gates an endpoint that declares nothing");
         assert!(matches!(denial, Error::Denied(_)), "{denial:?}");
         assert!(denial.to_string().contains(MOUNT), "{denial}");
-        // The denial has to say what to add — it is not guessable from a refusal.
-        assert!(
-            denial.to_string().contains("ModuleFloor::requiring"),
-            "{denial}"
-        );
+        // No assertion on the module's hint text (`ModuleFloor::requiring(..)`). Since core
+        // 0.1.85 (ledger #750, "the floor covers every verb") the kernel's pre-dispatch
+        // floor refuses first, with its own message, whenever the endpoint's card carries
+        // the mount's requirement, and every card under a floor does (`card_for`'s fallback
+        // included). So `ModuleFloor::denial`'s hint is unreachable for an endpoint with a
+        // card. The refusal itself is unchanged: `Denied`, naming the scope. A seam for the
+        // hint belongs in core, not here.
 
         assert!(block_on(kernel.issue(whoami(), &Capability::scoped([MOUNT]))).is_ok());
     }
