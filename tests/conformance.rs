@@ -12,7 +12,9 @@
 //!
 //! - `cell` — a threaded read: `Source` is `.cacheable()` under the golden thread named
 //!   after the resource, `Sink` replaces the value and cuts it. Declared `cacheable`. The
-//!   thread is the MODULE's own declaration, which through 0.2 never crossed a wire.
+//!   thread is the MODULE's own declaration, which through 0.2 never crossed a wire. The
+//!   `Sink` declares `urn:cap:demo:write`: a write nobody can be refused fails `AUTHORITY`
+//!   (conformance 0.3+), and a read-only caller must be able to hold `cell` without it.
 //! - `live` — a live read: uncacheable, a different byte string every time.
 //! - `upper` — a pure function of its one input: cacheable with an empty thread set.
 //!   Declared `pure` and `cacheable`.
@@ -27,7 +29,9 @@
 //!   provenance. Declared `cacheable`; a `Fixture` names two resources that exist.
 //!
 //! Beside the module, the host binds `urn:test:greeting` and `urn:test:subject` — the two
-//! resources `join` reaches for — threaded by their own names and declared `cacheable`.
+//! resources `join` reaches for — each threaded by its STATE (`urn:conformance:store:{id}`,
+//! not its own IRI, which since core 0.1.73 the kernel hangs every cacheable read on anyway)
+//! and declared `cacheable`.
 //!
 //! ## The mounts
 //!
@@ -53,10 +57,10 @@
 //! - **Cacheability is inherited by thread name**
 //!   ([`cacheability_is_inherited_by_thread_name`]): a module-declared thread crosses every
 //!   transport and a `Sink` through the mount cuts it; a callback-inherited thread is the
-//!   host resource's name and cutting THAT invalidates the module's result; a live read
-//!   stays live; a pure read caches with no thread. The suite sees "non-empty threads", not
-//!   WHICH — the 0.2 loopback cached `cell` forever with an empty set, and only `cacheable`
-//!   + this test would have said so.
+//!   host resource's state thread and cutting THAT invalidates the module's result; a live
+//!   read stays live; a pure read caches with no thread but its own name. The suite sees
+//!   "non-empty threads", not WHICH — the 0.2 loopback cached `cell` forever with an empty
+//!   set, and only `cacheable` + this test would have said so.
 //! - **Every error type survives, in both directions**
 //!   ([`typed_errors_survive_in_both_directions`]): a module endpoint's failure reaches the
 //!   host as the same `Error` variant with the same message; a host resource's failure
@@ -80,7 +84,7 @@
 
 use async_trait::async_trait;
 use futures::executor::block_on;
-use ikigai_conformance::{Check, Finding, Fixture, Report, Suite};
+use ikigai_conformance::{Check, Finding, Fixture, Report, SpaceNaming, Suite};
 use ikigai_core::{
     ActionSpec, Alias, AliasTable, ArgRef, ArgSpec, Capability, Description, Endpoint,
     EndpointSpace, Error, Exact, Expiry, Fallback, FnEndpoint, Invocation, Iri, Kernel, ReprType,
@@ -97,6 +101,7 @@ use std::sync::{Arc, Mutex};
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
 const READ_CAP: &str = "urn:cap:demo:read";
+const WRITE_CAP: &str = "urn:cap:demo:write";
 const MOUNT_CAP: &str = "urn:cap:module:demo";
 const TEXT: &str = "text/plain";
 const PREFIX: &str = "urn:mod:";
@@ -193,6 +198,7 @@ impl Leaf {
                     .action(ActionSpec::new(Verb::Source).output(TEXT))
                     .action(
                         ActionSpec::new(Verb::Sink)
+                            .requires(WRITE_CAP)
                             .input(ArgSpec::new("content").class(XSD_STRING))
                             .output(TEXT),
                     ),
@@ -280,10 +286,21 @@ impl Leaf {
     }
 }
 
-/// A fixed host resource, declaring a golden thread named after itself.
+/// The golden thread of a host resource's STATE: what a host cuts when the value behind
+/// `urn:test:{id}` changes.
+fn state_thread(id: &str) -> String {
+    format!("urn:conformance:store:{id}")
+}
+
+/// A host resource standing for host state, declaring the thread of that state. Not a
+/// thread named after its own IRI: since core 0.1.73 the kernel hangs every cacheable read
+/// on its own name anyway, so `depends_on(itself)` names nothing and conformance 0.5+
+/// reports it ("no golden thread but its own name"). The thread is the state's, and
+/// [`cacheability_is_inherited_by_thread_name`] cuts it.
 fn fixed(id: &'static str, body: &'static str) -> FnEndpoint {
-    FnEndpoint::new(id, move |inv| {
-        Ok(ok(body).cacheable().depends_on(inv.request.target.as_str()))
+    let thread = state_thread(id);
+    FnEndpoint::new(id, move |_inv| {
+        Ok(ok(body).cacheable().depends_on(thread.as_str()))
     })
     .with_description(
         Description::new(id)
@@ -354,47 +371,55 @@ fn cards_of(module: &Arc<dyn Space>) -> Vec<(String, Description)> {
 }
 
 /// One way to mount the module: the host's own space, the module's space (possibly
-/// aliased), what it declares about its naming, and the host's floor → the host's root.
+/// aliased), what it declares about its naming, and the host's floor → the module's space
+/// AS THE HOST SEES IT (the mount itself, not the host's root: the SPACE-NAME declaration in
+/// [`conforms`] is about this value). [`host_root`] puts it under the host's own resources.
 type Mount = fn(Arc<dyn Space>, Arc<dyn Space>, ModuleRewrite, ModuleFloor) -> Arc<dyn Space>;
 
-fn bare(
+/// The host's root over one mount: its own resources, then the module as mounted.
+fn host_root(
+    mount: Mount,
     host: Arc<dyn Space>,
+    module: Arc<dyn Space>,
+    rewrite: ModuleRewrite,
+    floor: ModuleFloor,
+) -> Arc<dyn Space> {
+    let mounted = mount(Arc::clone(&host), module, rewrite, floor);
+    root(host, mounted)
+}
+
+fn bare(
+    _host: Arc<dyn Space>,
     module: Arc<dyn Space>,
     _rewrite: ModuleRewrite,
     _floor: ModuleFloor,
 ) -> Arc<dyn Space> {
-    root(host, module)
+    module
 }
 
 fn in_process(
-    host: Arc<dyn Space>,
+    _host: Arc<dyn Space>,
     module: Arc<dyn Space>,
     rewrite: ModuleRewrite,
     floor: ModuleFloor,
 ) -> Arc<dyn Space> {
     let transport = Arc::new(InProcessTransport::from_arc(module).declaring(rewrite));
-    root(
-        host,
-        Arc::new(block_on(ModuleSpace::connect([PREFIX], transport, floor)).expect("connect")),
-    )
+    Arc::new(block_on(ModuleSpace::connect([PREFIX], transport, floor)).expect("connect"))
 }
 
 fn loopback(
-    host: Arc<dyn Space>,
+    _host: Arc<dyn Space>,
     module: Arc<dyn Space>,
     rewrite: ModuleRewrite,
     floor: ModuleFloor,
 ) -> Arc<dyn Space> {
     let transport = Arc::new(LoopbackTransport::from_arc(module).declaring(rewrite));
-    root(
-        host,
-        Arc::new(block_on(ModuleSpace::connect([PREFIX], transport, floor)).expect("connect")),
-    )
+    Arc::new(block_on(ModuleSpace::connect([PREFIX], transport, floor)).expect("connect"))
 }
 
 #[cfg(unix)]
 fn uds(
-    host: Arc<dyn Space>,
+    _host: Arc<dyn Space>,
     module: Arc<dyn Space>,
     rewrite: ModuleRewrite,
     floor: ModuleFloor,
@@ -418,15 +443,12 @@ fn uds(
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let transport = Arc::new(UdsTransport::connect(&path));
-    root(
-        host,
-        Arc::new(block_on(ModuleSpace::connect([PREFIX], transport, floor)).expect("connect")),
-    )
+    Arc::new(block_on(ModuleSpace::connect([PREFIX], transport, floor)).expect("connect"))
 }
 
 /// The browser split: the module's callbacks are served by a kernel over the HOST's space —
-/// whatever the host serves at its `hostCall` global — while the root the caller sees is the
-/// same host space plus the mount.
+/// whatever the host serves at its `hostCall` global — while the root the caller sees
+/// ([`host_root`]) is the same host space plus the mount.
 fn wasm(
     host: Arc<dyn Space>,
     module: Arc<dyn Space>,
@@ -435,7 +457,7 @@ fn wasm(
 ) -> Arc<dyn Space> {
     let transport = Arc::new(FakeTransport {
         module: Arc::clone(&module),
-        host: Arc::new(Kernel::new(Arc::clone(&host))),
+        host: Arc::new(Kernel::new(host)),
     });
     let mut space = WasmModuleSpace::new([PREFIX], transport, Description::new("demo"), floor)
         .declaring(rewrite)
@@ -443,7 +465,7 @@ fn wasm(
     for (pattern, description) in cards_of(&module) {
         space = space.with_endpoint(pattern, description);
     }
-    root(host, Arc::new(space))
+    Arc::new(space)
 }
 
 /// The bare space and every mount. The bare entry ignores the declaration and the floor:
@@ -453,7 +475,7 @@ fn mounts() -> Vec<(&'static str, Mount)> {
         ("bare", bare),
         ("ModuleSpace::connect / in-process", in_process),
         ("ModuleSpace::connect / loopback", loopback),
-        ("WasmModuleSpace / out-of-band", wasm),
+        ("WasmModuleSpace::new / out-of-band", wasm),
     ];
     #[cfg(unix)]
     mounts.push(("ModuleSpace::connect / unix socket", uds));
@@ -551,6 +573,22 @@ fn assert_shape(label: &str, report: &Report) {
     assert_eq!(report.declared.pure, ["upper", "echo"], "{label}");
 }
 
+/// The mount was declared host-named, and SPACE-NAME checked it.
+fn assert_host_named(label: &str, report: &Report) {
+    let spaces = &report.declared.spaces;
+    assert_eq!(spaces.len(), 1, "{label}: {report}");
+    assert_eq!(
+        spaces[0].naming,
+        SpaceNaming::HostNamed,
+        "{label}: {report}"
+    );
+    assert!(
+        spaces[0].label.ends_with(label),
+        "{label}: {}",
+        spaces[0].label
+    );
+}
+
 /// The walk, bare and through every mount: every report clean, every report the same
 /// shape — and the catalog and every description through a mount are the bare space's,
 /// verbatim, which the suite's static checks passing would not by themselves prove.
@@ -570,16 +608,24 @@ fn conforms() {
         .collect();
 
     for (label, mount) in mounted() {
-        let kernel = Kernel::new(mount(
-            host_space(),
+        let host = host_space();
+        let space = mount(
+            Arc::clone(&host),
             Leaf::new().space(),
             ModuleRewrite::None,
             ModuleFloor::public(),
-        ));
-        let report = suite().run_blocking(&kernel);
+        );
+        let kernel = Kernel::new(root(host, Arc::clone(&space)));
+        // SPACE-NAME: every mount is instance-built (prefixes, a transport, a floor), so the
+        // HOST names it and the mount claims nothing — two mounts of two different modules
+        // must never share a cache partition by a name the module chose.
+        let report = suite()
+            .host_named_space(format!("ikigai_module::{label}"), space)
+            .run_blocking(&kernel);
         eprintln!("{label}: {report}");
         assert!(report.is_clean(), "{label}: {report}");
         assert_shape(label, &report);
+        assert_host_named(label, &report);
         assert_eq!(
             catalog(&kernel),
             entries,
@@ -613,9 +659,13 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
         Arc::new(InProcessTransport::from_arc(leaf.space())),
         ModuleFloor::public(),
     );
-    let kernel = Kernel::new(root(host_space(), Arc::new(unasked)));
-    let report = host_suite().run_blocking(&kernel);
+    let unasked: Arc<dyn Space> = Arc::new(unasked);
+    let kernel = Kernel::new(root(host_space(), Arc::clone(&unasked)));
+    let report = host_suite()
+        .host_named_space("ikigai_module::ModuleSpace::new", Arc::clone(&unasked))
+        .run_blocking(&kernel);
     eprintln!("unasked: {report}");
+    assert_host_named("ModuleSpace::new", &report);
     // The module's rows are still listed (the transport enumerates)…
     assert_eq!(
         catalog(&kernel).len(),
@@ -689,7 +739,8 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
 #[test]
 fn the_floor_is_visible_and_enforced() {
     for (label, mount) in mounted() {
-        let kernel = Kernel::new(mount(
+        let kernel = Kernel::new(host_root(
+            mount,
             host_space(),
             Leaf::new().space(),
             ModuleRewrite::None,
@@ -747,14 +798,15 @@ fn source_as(kernel: &Kernel, iri: &str, capability: &Capability) -> Result<Repr
 
 /// A read through a mount is exactly as cacheable as the module says, thread names
 /// included: the module's own declared thread crosses and its `Sink` cuts it; a
-/// callback-inherited thread is the host resource's name and cutting that invalidates the
+/// callback-inherited thread is the host resource's state thread and cutting that invalidates the
 /// module's result; a live read stays live; a pure read caches with no thread.
 #[test]
 fn cacheability_is_inherited_by_thread_name() {
     let join_args = [("a", "urn:test:greeting"), ("b", "urn:test:subject")];
     for (label, mount) in mounts() {
         let leaf = Leaf::new();
-        let kernel = Kernel::new(mount(
+        let kernel = Kernel::new(host_root(
+            mount,
             host_space(),
             leaf.space(),
             ModuleRewrite::None,
@@ -801,8 +853,8 @@ fn cacheability_is_inherited_by_thread_name() {
         assert_eq!(first.expiry, Expiry::Never, "{label}: join is cacheable");
         let threads = first.threads();
         assert!(
-            threads.contains(&Thread::new("urn:test:greeting"))
-                && threads.contains(&Thread::new("urn:test:subject")),
+            threads.contains(&Thread::new(state_thread("greeting")))
+                && threads.contains(&Thread::new(state_thread("subject"))),
             "{label}: the callbacks' provenance rides on the result: {threads:?}"
         );
         source(&kernel, "urn:mod:join", &join_args).unwrap();
@@ -811,7 +863,7 @@ fn cacheability_is_inherited_by_thread_name() {
             1,
             "{label}: the second read was a cache hit"
         );
-        kernel.cut("urn:test:greeting");
+        kernel.cut(state_thread("greeting").as_str());
         assert!(
             !kernel.is_cached(&request(Verb::Source, "urn:mod:join", &join_args), &root),
             "{label}: cutting a host resource reaches the module's result"
@@ -916,7 +968,8 @@ fn typed_errors_survive_in_both_directions() {
                 Exact::new("urn:mod:failing"),
                 failing("failing", error.clone()),
             ));
-            let kernel = Kernel::new(mount(
+            let kernel = Kernel::new(host_root(
+                mount,
                 host_space(),
                 module,
                 ModuleRewrite::None,
@@ -935,7 +988,8 @@ fn typed_errors_survive_in_both_directions() {
                 Exact::new("urn:test:failing"),
                 failing("failing", error.clone()),
             ));
-            let kernel = Kernel::new(mount(
+            let kernel = Kernel::new(host_root(
+                mount,
                 failing_host,
                 module,
                 ModuleRewrite::None,
@@ -1024,7 +1078,8 @@ fn the_canonical_survives_every_mount() {
     for (label, mount) in mounts() {
         let leaf = Leaf::new();
         let aliased: Arc<dyn Space> = Arc::new(Alias::new(Arc::clone(&table), leaf.space()));
-        let kernel = Kernel::new(mount(
+        let kernel = Kernel::new(host_root(
+            mount,
             host_space(),
             aliased,
             ModuleRewrite::from_table(&table),

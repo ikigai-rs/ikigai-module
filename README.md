@@ -184,6 +184,11 @@ instead of a line in the report that merely *reads* as a check that ran. The cos
 is counted the same way — the module's own suite run over a `new` mount reports all seven of
 its statements inert.
 
+**A mount has no name of its own.** `ModuleSpace::new`, `ModuleSpace::connect` and
+`WasmModuleSpace::new` are all instance-built (prefixes, a transport, a floor), so none claims
+a space IRI: the HOST names a mount, because only it knows which module it loaded. The suite
+declares each one `host_named_space`, and `SPACE-NAME` holds it to claiming nothing.
+
 ## Composing a rewriting space in a module
 
 Any space should be composable in any module, including one that resolves one name under

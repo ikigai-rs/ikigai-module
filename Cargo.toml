@@ -85,8 +85,16 @@ libc = "0.2"
 # The module recipe as one test, across the boundary (`tests/conformance.rs`): one fixture
 # module walked bare and through every mount, every report held to the bare one —
 # identical catalog and descriptions, cacheability by thread name, every error type
-# preserved in both directions. 0.2.0 pulls ikigai-core 0.1.69, which the caret above
-# admits; the library itself needs nothing past its own pin.
+# preserved in both directions.
+#
+# 0.6.0 = `SPACE-NAME` (ledger #987): the test declares each space constructor host-named.
+# It pulls ikigai-core 0.1.89 into every test build, which the caret above admits; the
+# `[dependencies]` pin stays at 0.1.73 ON PURPOSE, because a pin states the LIBRARY's true
+# minimum (rule 5) and the library calls nothing newer. Raising it to match the test build
+# would only shut lockless consumers on 0.1.73..0.1.88 out of a crate that works for them.
+# ⚠ Read this caret as a RANGE too: under 0.x `"0.6.0"` is `<0.7.0`, a ceiling. The 0.2.0
+# pin this replaced held the suite at 0.2 through four minor releases that kept reporting
+# green against the old definition of done.
 #
 # 0.2.0 = `Check::Declarations`, which is why the floor moved: it reports a declaration no
 # check consulted, and this crate's walk is the case it was written for. One suite was being
@@ -94,4 +102,4 @@ libc = "0.2"
 # `ModuleSpace::new`, which never asks — so through the latter every statement about a module
 # endpoint named an id the walk could not reach, and the report printed them anyway. The fix
 # is one suite per manifold, not a version floor; the pin is what surfaced it.
-ikigai-conformance = "0.2.0"
+ikigai-conformance = "0.6.0"
