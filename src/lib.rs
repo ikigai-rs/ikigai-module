@@ -4199,11 +4199,13 @@ mod tests {
             .expect_err("the mount's floor gates an endpoint that declares nothing");
         assert!(matches!(denial, Error::Denied(_)), "{denial:?}");
         assert!(denial.to_string().contains(MOUNT), "{denial}");
-        // The denial has to say what to add — it is not guessable from a refusal.
-        assert!(
-            denial.to_string().contains("ModuleFloor::requiring"),
-            "{denial}"
-        );
+        // No assertion on the module's hint text (`ModuleFloor::requiring(..)`). Since core
+        // 0.1.85 (ledger #750, "the floor covers every verb") the kernel's pre-dispatch
+        // floor refuses first, with its own message, whenever the endpoint's card carries
+        // the mount's requirement, and every card under a floor does (`card_for`'s fallback
+        // included). So `ModuleFloor::denial`'s hint is unreachable for an endpoint with a
+        // card. The refusal itself is unchanged: `Denied`, naming the scope. A seam for the
+        // hint belongs in core, not here.
 
         assert!(block_on(kernel.issue(whoami(), &Capability::scoped([MOUNT]))).is_ok());
     }
