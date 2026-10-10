@@ -22,7 +22,12 @@ name = "ikigai-module"
 # (which adds `Resolved.answered_by`) as well as every earlier core the pin admits.
 # Published BEFORE core 0.1.78 on purpose: this crate commits no lockfile, and 0.3.0 on
 # crates.io stops compiling for every lockless consumer the moment 0.1.78 is published.
-version = "0.3.1"
+#
+# 0.3.2: no API change. `serve_host_call` records a FAILED host call as a dependency by
+# core's rule for a failed sub-request (ledger #530): a miss hangs the module's answer
+# from the missing name, any other error makes it uncacheable. The core floor moves to
+# 0.1.73 so the in-band transports, which inherit that rule from `inv.issue`, agree.
+version = "0.3.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -32,6 +37,14 @@ homepage = "https://github.com/ikigai-rs/ikigai-module"
 keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 
 [dependencies]
+# 0.1.73 = a failed sub-request is recorded as a dependency (`Invocation::issue`: a miss
+# hangs the composite from the missing name, any other error makes it uncacheable). The
+# in-band host loop resolves through `inv.issue`, so below 0.1.73 a module that swallows a
+# host-call failure over the in-process or loopback transport is cached with no edge on
+# what was missing, while the out-of-band path (`serve_host_call`, which applies the rule
+# itself) is not. Measured by resolving fresh at `=0.1.72` (the in-band test fails) and
+# `=0.1.73` (all pass). This is a BEHAVIOR floor: no API here is newer than 0.1.64.
+#
 # 0.1.64 = `Resolved.canonical` (the alias/rewrite-reporting field) with `Resolved::new`
 # and `Resolved::with_canonical`, which both `Space::resolve` impls below use to report the
 # module's declared rewrite. The pin states the true minimum API this crate CALLS — not the
@@ -49,7 +62,7 @@ keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 # `AliasTable::{parse, to_text}` (the declaration's text form on the wire), `AliasRule`'s
 # accessors (mount-time validation) and `Canonical` — plus, decisively, the kernel ADOPTING
 # a reported canonical, without which a declared rewrite would resolve and still split.
-ikigai-core = "0.1.64"
+ikigai-core = "0.1.73"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 # A module's card crosses the wire as JSON text inside the postcard frame: core's

@@ -139,7 +139,11 @@ its bytes:
   nothing to cut it**, and a `Sink` through the mount left it stale. `ModuleReply::ResolvedThreaded`
   carries the thread names beside the bytes and the host re-attaches them. (The threads of
   host resources a module resolves through its callbacks never needed to cross: the host
-  records those on the outer invocation.)
+  records those on the outer invocation, and since 0.3.2 it records a callback that
+  FAILED by core's rule for a failed sub-request on every transport, wasm included. A
+  `NotFound` or `Unresolved` hangs the module's answer from the missing name, so a module
+  that swallows the miss and answers a fallback is cut by the `Sink` that creates it; any
+  other failure makes the answer uncacheable.)
 - **The module's cards.** `ModuleSpace::connect` asks for every binding's `describe()`
   (`ModuleCall::Cards`) and installs them beside the host's own, the floor folded in — so
   an endpoint describes itself through the mount, inputs, outputs and its own `requires`,
