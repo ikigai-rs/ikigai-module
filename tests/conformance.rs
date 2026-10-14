@@ -337,7 +337,7 @@ struct FakeTransport {
 
 #[async_trait]
 impl ModuleSessionTransport for FakeTransport {
-    async fn invoke_session(&self, invoke: Vec<u8>) -> Result<Vec<u8>, String> {
+    async fn invoke_session(&self, invoke: Vec<u8>) -> ikigai_core::Result<Vec<u8>> {
         let host = Arc::clone(&self.host);
         let host_call = move |reply: Vec<u8>| {
             let host = Arc::clone(&host);
