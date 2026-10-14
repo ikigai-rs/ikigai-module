@@ -97,6 +97,12 @@ libc = "0.2"
 # identical catalog and descriptions, cacheability by thread name, every error type
 # preserved in both directions.
 #
+# 0.8.0 = `REQUIRED` (ledger #329): each required by-value input the fixture declares
+# (`upper`'s `in`, `join`'s `a` and `b`, and, under `Suite::required_on_mutating`, `cell`'s
+# `content`) is dropped from the walked call and must be refused with a typed
+# `MissingArgument`, through every mount as well as bare. Also `VALIDATE` (0.7). Like the
+# 0.6.0 pin before it, this caret is a CEILING (`<0.9.0`) as well as a floor.
+#
 # 0.6.0 = `SPACE-NAME` (ledger #987): the test declares each space constructor host-named.
 # It pulls ikigai-core 0.1.89 into every test build, which the caret above admits; the
 # `[dependencies]` pin stays at 0.1.73 ON PURPOSE, because a pin states the LIBRARY's true
@@ -112,4 +118,4 @@ libc = "0.2"
 # `ModuleSpace::new`, which never asks — so through the latter every statement about a module
 # endpoint named an id the walk could not reach, and the report printed them anyway. The fix
 # is one suite per manifold, not a version floor; the pin is what surfaced it.
-ikigai-conformance = "0.6.0"
+ikigai-conformance = "0.8.0"
