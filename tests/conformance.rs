@@ -49,7 +49,8 @@
 //!   `ModuleSpace::new` the manifold is one endpoint, `module`, with no actions — the
 //!   0.2 state, kept as the documented cost of not asking. That cost is also counted:
 //!   run the module's own suite over that mount and all seven of its statements about the
-//!   module report inert, because there is no `cell` and no `join` to hold them to.
+//!   module's endpoints report inert, because there is no `cell` and no `join` to hold them
+//!   to, and so does `required_on_mutating`, because there is no `Sink` to drop from.
 //! - **The floor is visible AND enforced** ([`the_floor_is_visible_and_enforced`]): under
 //!   `ModuleFloor::requiring(..)` every module action's card carries the scope, the walk is
 //!   clean (ENFORCED sees the floor's typed `Denied`), and the module's own `requires`
@@ -512,6 +513,12 @@ fn suite() -> Suite {
         .cacheable("join")
         .pure("upper")
         .pure("echo")
+        // REQUIRED drops `cell`'s required `content` from a `Sink` too, through every mount:
+        // each drop is a firing, and every fixture here is in-memory (a `Mutex<String>`;
+        // the unix-socket mount serves the same module over a temp-dir socket), with no
+        // process, network or model reach. A wrongly accepted drop would only overwrite
+        // the cell, which the walk's own pipeline probe already does.
+        .required_on_mutating()
 }
 
 fn request(verb: Verb, iri: &str, args: &[(&str, &str)]) -> Request {
@@ -571,6 +578,7 @@ fn assert_shape(label: &str, report: &Report) {
         "{label}"
     );
     assert_eq!(report.declared.pure, ["upper", "echo"], "{label}");
+    assert!(report.declared.required_on_mutating, "{label}");
 }
 
 /// The mount was declared host-named, and SPACE-NAME checked it.
@@ -690,16 +698,25 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
     // What not asking costs, counted: hand this mount the suite every other mount passes
     // clean and EVERY statement it makes about the module goes inert — four `cacheable`,
     // two `pure` and the `join` fixture, each for the one structural reason that there is
-    // no endpoint by that id to hold. The host's own two declarations are untouched: a
-    // mount cannot reach them. DECLARATIONS is what says so; through conformance 0.1 all
-    // seven were printed under `declared cacheable:` as though a check had consulted them.
+    // no endpoint by that id to hold, plus `required_on_mutating`, because there is no
+    // `cell` `Sink` to drop `content` from. The host's own two declarations are untouched:
+    // a mount cannot reach them. DECLARATIONS is what says so; through conformance 0.1 all
+    // seven per-id ones were printed under `declared cacheable:` as though a check had
+    // consulted them.
     let report = suite().run_blocking(&kernel);
     eprintln!("unasked, under the module's own suite: {report}");
-    let inert: Vec<&Finding> = report
+    let (suite_wide, inert): (Vec<&Finding>, Vec<&Finding>) = report
         .findings
         .iter()
         .filter(|f| f.check == Check::Declarations)
-        .collect();
+        .partition(|f| f.endpoint == "(suite)");
+    assert_eq!(suite_wide.len(), 1, "{report}");
+    assert!(
+        suite_wide[0]
+            .detail
+            .contains("`Suite::required_on_mutating` reached nothing"),
+        "{report}"
+    );
     assert_eq!(
         inert.len(),
         7,
