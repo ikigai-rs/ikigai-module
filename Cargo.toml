@@ -27,7 +27,17 @@ name = "ikigai-module"
 # core's rule for a failed sub-request (ledger #530): a miss hangs the module's answer
 # from the missing name, any other error makes it uncacheable. The core floor moves to
 # 0.1.73 so the in-band transports, which inherit that rule from `inv.issue`, agree.
-version = "0.3.2"
+#
+# 0.4.0: source-breaking for a HOST that writes its own `ModuleSessionTransport`:
+# `invoke_session` returns `ikigai_core::Result<Vec<u8>>`, not `Result<Vec<u8>, String>`,
+# so a channel that cannot reach its module says `Unavailable` instead of becoming an
+# `Error::Endpoint` string (ledger #746). `wasm_module_channel!` writes that transport for a
+# global JS function and fails at once, typed, when the page never wired it; `wasm_module!`'s
+# `hostCall` does the same on the module side (both used to hang). Behavior, with no
+# signature change: `serve_host_call` clamps the capability a module's host call CARRIES to
+# the capability of the session that invoked it, and refuses a host call with no session in
+# flight (ledger #83: a wasm module could hand itself root). The module wire is unchanged.
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
