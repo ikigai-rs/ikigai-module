@@ -1630,11 +1630,18 @@ where
 /// `Invoke`, returning the encoded `ModuleReply`. The host wraps the actual call (e.g. a
 /// lazy-loaded wasm instance's `invoke_session` over a JS shim); the module pumps its
 /// `HostCall`s to the global the host serves with [`serve_host_call`] while this awaits.
+/// [`wasm_module_channel!`] writes the browser one, over a global JS function.
+///
+/// A failure is an [`Error`], typed: a module that cannot be reached at all is
+/// [`Error::Unavailable`], so the caller is told what happened instead of reading every
+/// transport failure as an endpoint string. (Through 0.3 this returned `Result<_, String>`
+/// and every failure became [`Error::Endpoint`].) A failure INSIDE the session is not one of
+/// these: the module encodes it in its reply, and it keeps its own type.
 #[async_trait]
 pub trait ModuleSessionTransport: Send + Sync {
     /// Run the module session for `invoke` (an encoded [`ModuleCall::Invoke`]) and return
     /// the encoded final [`ModuleReply`].
-    async fn invoke_session(&self, invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String>;
+    async fn invoke_session(&self, invoke: Vec<u8>) -> Result<Vec<u8>>;
 }
 
 /// The cache provenance accumulated from one transform's out-of-band `HostCall`s, so the
@@ -2000,7 +2007,7 @@ impl Endpoint for WasmModuleEndpoint {
         let sink_id = install_sink(inv.capability.clone());
         let result = self.transport.invoke_session(invoke).await;
         let collected = take_sink(sink_id);
-        let reply_bytes = result.map_err(Error::Endpoint)?;
+        let reply_bytes = result?;
 
         // The module's own declared threads and a typed failure come back through
         // `outcome_from`; the callbacks' provenance the host collected out-of-band is folded
@@ -2029,7 +2036,10 @@ impl Endpoint for WasmModuleEndpoint {
 /// Generate the wasm-bindgen glue that makes a module's `space()` a standalone, lazily
 /// loadable artifact — so a new module is one macro line, not a hand-written crate. Emits a
 /// public `invoke_session(Vec<u8>) -> Vec<u8>` (async) that runs [`run_session`] over the
-/// given space, plus the `hostCall` import and the `!Send`→`Send` bridge it needs.
+/// given space, plus the call to the host's `hostCall` global and the `!Send`→`Send` bridge
+/// it needs. A host that never set `globalThis.hostCall` fails the module's host call at
+/// once, with a message naming the global, instead of leaving the session to hang (through
+/// 0.3 it was a wasm-bindgen import, and an unset global never answered).
 ///
 /// Use it in a `cdylib` crate that depends on `ikigai-module`, `ikigai-core`, `wasm-bindgen`,
 /// `wasm-bindgen-futures`, `js-sys`, and `futures`, with `use wasm_bindgen::prelude::*;` in
@@ -2050,18 +2060,10 @@ macro_rules! wasm_module {
             $crate::run_session(&space, &invoke, __ikigai_module_host_call).await
         }
 
-        // The host's session pump, a global import: hand it an encoded `ModuleReply`
-        // (a `HostCall`) and it returns the encoded `ModuleCall` (the `HostResult`).
-        #[::wasm_bindgen::prelude::wasm_bindgen]
-        extern "C" {
-            #[::wasm_bindgen::prelude::wasm_bindgen(catch, js_name = "hostCall")]
-            async fn __ikigai_module_host_call_js(
-                reply: &[u8],
-            ) -> ::core::result::Result<::wasm_bindgen::JsValue, ::wasm_bindgen::JsValue>;
-        }
-
-        // Bridge the `!Send` JS call to the `Send` future `run_session` needs: confine the
-        // `JsFuture` to a `spawn_local` task and ferry the bytes back through a oneshot.
+        // The host's session pump, the global `hostCall`: hand it an encoded `ModuleReply`
+        // (a `HostCall`) and it returns the encoded `ModuleCall` (the `HostResult`). Bridge
+        // the `!Send` JS call to the `Send` future `run_session` needs: confine it to a
+        // `spawn_local` task and ferry the bytes back through a oneshot.
         fn __ikigai_module_host_call(
             reply: ::std::vec::Vec<u8>,
         ) -> impl ::core::future::Future<
@@ -2069,16 +2071,7 @@ macro_rules! wasm_module {
         > + ::core::marker::Send {
             let (tx, rx) = ::futures::channel::oneshot::channel();
             ::wasm_bindgen_futures::spawn_local(async move {
-                let result = match __ikigai_module_host_call_js(&reply).await {
-                    ::core::result::Result::Ok(value) => {
-                        ::core::result::Result::Ok(::js_sys::Uint8Array::new(&value).to_vec())
-                    }
-                    ::core::result::Result::Err(e) => ::core::result::Result::Err(
-                        ::wasm_bindgen::JsValue::as_string(&e)
-                            .unwrap_or_else(|| ::std::string::String::from("hostCall failed")),
-                    ),
-                };
-                let _ = tx.send(result);
+                let _ = tx.send($crate::__js_channel_call!("hostCall", reply).await);
             });
             async move {
                 rx.await
@@ -2086,6 +2079,144 @@ macro_rules! wasm_module {
             }
         }
     };
+}
+
+/// Generate a host's [`ModuleSessionTransport`] over a global JS function, the browser
+/// channel a [`WasmModuleSpace`] reaches a lazily loaded module through: a unit struct that
+/// hands the encoded `Invoke` to `globalThis[<name>]` and awaits the encoded reply. So a
+/// host mounts a lazy module with one line here and one [`WasmModuleSpace::new`], with no
+/// hand-written `spawn_local` bridge per module.
+///
+/// **An unwired channel fails at once, typed.** When the page never set the global (or set
+/// it to something that is not a function), the session answers
+/// [`Error::Unavailable`](ikigai_core::Error::Unavailable) naming the global, without
+/// waiting. So does a channel that throws, rejects, or answers something other than bytes.
+/// A hand-written channel declared as a `#[wasm_bindgen(catch)] async fn` import does NOT:
+/// with the global unset, the import's error path still awaits a promise that is not there,
+/// the `spawn_local` task dies on a `TypeError` before it answers, and the request waits
+/// forever with nothing on the page (ledger #746: an unwired `shaclInvokeSession`).
+///
+/// Use it in a crate that depends on `ikigai-module`, `ikigai-core`, `wasm-bindgen`,
+/// `wasm-bindgen-futures`, `js-sys`, and `futures` (the set [`wasm_module!`] needs):
+///
+/// ```ignore
+/// ikigai_module::wasm_module_channel!(BrowserShaclTransport = "shaclInvokeSession");
+///
+/// let space = WasmModuleSpace::new(
+///     ["urn:shacl:"],
+///     Arc::new(BrowserShaclTransport),
+///     card(),
+///     ModuleFloor::public(),
+/// );
+/// ```
+#[macro_export]
+macro_rules! wasm_module_channel {
+    ($(#[$attr:meta])* $vis:vis $name:ident = $global:literal) => {
+        $(#[$attr])*
+        $vis struct $name;
+
+        #[$crate::__private::async_trait]
+        impl $crate::ModuleSessionTransport for $name {
+            async fn invoke_session(
+                &self,
+                invoke: ::std::vec::Vec<u8>,
+            ) -> $crate::__private::Result<::std::vec::Vec<u8>> {
+                // `JsValue` is `!Send`: confine the call to a `spawn_local` task and ferry the
+                // (`Send`) bytes back through a oneshot.
+                let (tx, rx) = ::futures::channel::oneshot::channel();
+                ::wasm_bindgen_futures::spawn_local(async move {
+                    let _ = tx.send($crate::__js_channel_call!($global, invoke).await);
+                });
+                match rx.await {
+                    ::core::result::Result::Ok(answer) => {
+                        answer.map_err($crate::__private::Error::Unavailable)
+                    }
+                    ::core::result::Result::Err(_) => {
+                        ::core::result::Result::Err($crate::__private::Error::Unavailable(
+                            ::std::format!("module channel `{}`: its task was dropped", $global),
+                        ))
+                    }
+                }
+            }
+        }
+    };
+}
+
+/// Call the global JS function named `$global` with `$bytes` and await its answer as bytes:
+/// `Err(message)` at once when the global is not a function, or when the call throws,
+/// rejects, or answers something other than bytes. The shared body of [`wasm_module!`]'s
+/// `hostCall` and [`wasm_module_channel!`]. Looked up per call through `globalThis`, never
+/// as a wasm-bindgen import, so a page may wire the channel after the wasm loads.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __js_channel_call {
+    ($global:expr, $bytes:expr) => {
+        async {
+            use ::wasm_bindgen::JsCast as _;
+            let name: &str = $global;
+            let describe = |e: ::wasm_bindgen::JsValue| -> ::std::string::String {
+                e.as_string()
+                    .or_else(|| {
+                        e.dyn_ref::<::js_sys::Error>()
+                            .map(|e| ::std::string::String::from(e.message()))
+                    })
+                    .unwrap_or_else(|| ::std::format!("{e:?}"))
+            };
+            let channel = ::js_sys::Reflect::get(
+                &::js_sys::global(),
+                &::wasm_bindgen::JsValue::from_str(name),
+            )
+            .ok()
+            .and_then(|value| value.dyn_into::<::js_sys::Function>().ok());
+            match channel {
+                ::core::option::Option::None => ::core::result::Result::Err(::std::format!(
+                    "module channel `{name}` is not wired: the global object has no function \
+                     named `{name}`"
+                )),
+                ::core::option::Option::Some(channel) => {
+                    let bytes: &[u8] = &$bytes;
+                    let argument = ::js_sys::Uint8Array::from(bytes);
+                    match channel.call1(&::wasm_bindgen::JsValue::UNDEFINED, &argument) {
+                        ::core::result::Result::Err(e) => ::core::result::Result::Err(
+                            ::std::format!("module channel `{name}` threw: {}", describe(e)),
+                        ),
+                        ::core::result::Result::Ok(returned) => {
+                            let promise = ::js_sys::Promise::resolve(&returned);
+                            match ::wasm_bindgen_futures::JsFuture::from(promise).await {
+                                ::core::result::Result::Err(e) => {
+                                    ::core::result::Result::Err(::std::format!(
+                                        "module channel `{name}` rejected: {}",
+                                        describe(e)
+                                    ))
+                                }
+                                ::core::result::Result::Ok(value)
+                                    if value.is_instance_of::<::js_sys::Uint8Array>()
+                                        || value.is_instance_of::<::js_sys::ArrayBuffer>() =>
+                                {
+                                    ::core::result::Result::Ok(
+                                        ::js_sys::Uint8Array::new(&value).to_vec(),
+                                    )
+                                }
+                                ::core::result::Result::Ok(value) => {
+                                    ::core::result::Result::Err(::std::format!(
+                                        "module channel `{name}` answered {value:?}, not bytes"
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+/// What the exported macros name through `$crate`, so a consumer needs no `async-trait`
+/// dependency of its own and the expansion does not depend on its `ikigai-core` spelling.
+#[doc(hidden)]
+pub mod __private {
+    pub use async_trait::async_trait;
+    pub use ikigai_core::{Error, Result};
 }
 
 // ---------------------------------------------------------------------------
@@ -3057,7 +3188,7 @@ mod tests {
 
     #[async_trait]
     impl ModuleSessionTransport for FakeTransport {
-        async fn invoke_session(&self, invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
+        async fn invoke_session(&self, invoke: Vec<u8>) -> Result<Vec<u8>> {
             let host = Arc::clone(&self.host);
             let host_call = move |reply: Vec<u8>| {
                 let host = Arc::clone(&host);
@@ -3115,6 +3246,40 @@ mod tests {
         assert!(kernel.is_cached(&concat_request(), &Capability::root()));
     }
 
+    /// A channel that cannot reach its module at all, as `wasm_module_channel!` answers for a
+    /// global the page never set.
+    struct UnwiredTransport;
+
+    #[async_trait]
+    impl ModuleSessionTransport for UnwiredTransport {
+        async fn invoke_session(&self, _invoke: Vec<u8>) -> Result<Vec<u8>> {
+            Err(Error::Unavailable(
+                "module channel `stubInvokeSession` is not wired".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn an_unreachable_module_is_unavailable_not_an_endpoint_string() {
+        // Ledger #746: the session transport's failure keeps its type through the mount.
+        // Through 0.3 the transport answered `Result<_, String>` and every failure surfaced
+        // as `Error::Endpoint`, so "the page never wired the channel" read like a bug in
+        // the module.
+        let kernel = Kernel::with_meta_renderer(
+            Arc::new(WasmModuleSpace::new(
+                ["urn:stub:"],
+                Arc::new(UnwiredTransport),
+                Description::new("stub-unwired"),
+                ModuleFloor::public(),
+            )) as Arc<dyn Space>,
+            Arc::new(PlainRenderer),
+        );
+        match block_on(kernel.issue(concat_request(), &Capability::root())) {
+            Err(Error::Unavailable(message)) => assert!(message.contains("stubInvokeSession")),
+            other => panic!("expected a typed Unavailable, got {other:?}"),
+        }
+    }
+
     // --- The out-of-band host call is held to its session (ledger #83) -----------------
     //
     // A wasm module is arbitrary code: it writes its own `HostCall` bytes, capability
@@ -3167,23 +3332,21 @@ mod tests {
 
     #[async_trait]
     impl ModuleSessionTransport for ForgingTransport {
-        async fn invoke_session(&self, _invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
+        async fn invoke_session(&self, _invoke: Vec<u8>) -> Result<Vec<u8>> {
             let forged = encode(&ModuleReply::HostCall {
                 request: Request::new(Verb::Source, Iri::parse("urn:test:authority").unwrap()),
                 capability: self.claimed.clone(),
-            })
-            .map_err(|e| e.to_string())?;
+            })?;
             let host = Arc::clone(&self.host);
             let answer = serve_host_call(&forged, |request, capability| async move {
                 host.issue(request, &capability).await
             })
             .await;
-            let reply = match answer_from(decode::<ModuleCall>(&answer).map_err(|e| e.to_string())?)
-            {
+            let reply = match answer_from(decode::<ModuleCall>(&answer)?) {
                 Ok(representation) => ModuleReply::Resolved(representation),
                 Err(error) => ModuleReply::ErrorTyped(ModuleError::from(&error)),
             };
-            encode(&reply).map_err(|e| e.to_string())
+            encode(&reply)
         }
     }
 
@@ -3336,12 +3499,12 @@ mod tests {
 
     #[async_trait]
     impl ModuleSessionTransport for SameKernelTransport {
-        async fn invoke_session(&self, invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
+        async fn invoke_session(&self, invoke: Vec<u8>) -> Result<Vec<u8>> {
             let host = self
                 .host
                 .get()
                 .and_then(std::sync::Weak::upgrade)
-                .ok_or("the host kernel is gone")?;
+                .ok_or_else(|| Error::Unavailable("the host kernel is gone".to_string()))?;
             let host_call = move |reply: Vec<u8>| {
                 let host = Arc::clone(&host);
                 async move {
@@ -3518,10 +3681,7 @@ mod tests {
         struct NeverTransport;
         #[async_trait]
         impl ModuleSessionTransport for NeverTransport {
-            async fn invoke_session(
-                &self,
-                _invoke: Vec<u8>,
-            ) -> std::result::Result<Vec<u8>, String> {
+            async fn invoke_session(&self, _invoke: Vec<u8>) -> Result<Vec<u8>> {
                 panic!("transport invoked for a metadata-only operation — module loaded eagerly");
             }
         }
@@ -3570,10 +3730,7 @@ mod tests {
         struct NeverTransport;
         #[async_trait]
         impl ModuleSessionTransport for NeverTransport {
-            async fn invoke_session(
-                &self,
-                _invoke: Vec<u8>,
-            ) -> std::result::Result<Vec<u8>, String> {
+            async fn invoke_session(&self, _invoke: Vec<u8>) -> Result<Vec<u8>> {
                 unreachable!()
             }
         }
@@ -4509,10 +4666,7 @@ mod tests {
         struct NeverTransport;
         #[async_trait]
         impl ModuleSessionTransport for NeverTransport {
-            async fn invoke_session(
-                &self,
-                _invoke: Vec<u8>,
-            ) -> std::result::Result<Vec<u8>, String> {
+            async fn invoke_session(&self, _invoke: Vec<u8>) -> Result<Vec<u8>> {
                 panic!("the floor must refuse before anything crosses the boundary");
             }
         }

@@ -26,7 +26,7 @@ module's result is cached and invalidated exactly as a statically-linked space w
 | `ModuleCall` / `ModuleReply` | wire | The Phase-2 session protocol (`Invoke` / `HostCall` / `HostResult` / `Resolved` / …). Pinned now even though the in-process transport calls directly. |
 | `LoopbackTransport` | host | The same session run **through the codec** — every message postcard-encoded over an in-memory byte channel, both ends in-process. Proves the protocol without a socket. |
 | `UdsTransport` / `serve` | both | The first real home: the module runs out-of-process behind a peercred-guarded Unix socket, driven over framed socket I/O. |
-| `WasmModuleSpace` / `wasm_module!` | both | The lazy browser module: one macro line emits the artifact's glue, one `WasmModuleSpace` binds it host-side. |
+| `WasmModuleSpace` / `wasm_module!` / `wasm_module_channel!` | both | The lazy browser module: one macro line emits the artifact's glue; host-side, one `wasm_module_channel!` line names the JS channel and one `WasmModuleSpace` binds it, and the host's `hostCall` export calls `serve_host_call`, which holds every callback to the capability of the session that invoked the module. An unwired channel answers `Unavailable` at once instead of hanging. |
 | `ModuleRewrite` / `ModuleManifest` | wire | How the module **names** things — what lets it compose a rewriting space (see below). |
 | `ModuleFloor` | host | What the mount **may do** — the capability floor every non-`Meta` verb under it requires. The host's word, not the module's (see below). |
 | `ModuleError` | wire | The error taxonomy on the module wire — a mirror of `ikigai_core::Error`, so a failure keeps its **type** across the boundary in both directions (see below). |
