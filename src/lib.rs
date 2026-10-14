@@ -1617,8 +1617,9 @@ where
 // the host made. So the browser pattern splits in two, joined by a per-transform sink:
 //   * `WasmModuleSpace` drives `invoke_session` (over a host-supplied [`ModuleSessionTransport`])
 //     and folds the sink into the result;
-//   * `serve_host_call` (called by the host's global `hostCall`) resolves each HostCall and
-//     records it into the active sink.
+//   * `serve_host_call` (called by the host's global `hostCall`) resolves each HostCall,
+//     clamped to the in-flight session's capability (the module's carried one is a claim),
+//     and records it into the active sink.
 // Both are plain Rust — the host wraps the actual (wasm-bindgen) JS calls. The
 // `wasm_module!` macro generates the matching module-side glue. So a new lazy module costs:
 // one `wasm_module!(space)` (its artifact) + one `WasmModuleSpace::new(..)` (the host
@@ -1684,32 +1685,68 @@ impl DepSink {
     }
 }
 
+/// One in-flight [`WasmModuleSpace`] invocation, as `serve_host_call` sees it: the
+/// capability its session runs under (the most any of its host calls may use) and the sink
+/// its host calls' provenance goes into.
+struct InFlight {
+    id: u64,
+    capability: Capability,
+    sink: RefCell<DepSink>,
+}
+
 thread_local! {
-    // Sinks of all in-flight WasmModuleSpace invocations on this (single-threaded) host,
-    // keyed by id so an invocation holds only the `u64` across its await (not a `!Send`
-    // handle). `serve_host_call` records into every active sink; nesting just
-    // over-approximates dependencies, which is safe.
-    static DEP_SINKS: RefCell<Vec<(u64, RefCell<DepSink>)>> = const { RefCell::new(Vec::new()) };
+    // All in-flight WasmModuleSpace invocations on this (single-threaded) host, keyed by id
+    // so an invocation holds only the `u64` across its await (not a `!Send` handle).
+    // `serve_host_call` records into every active sink (nesting just over-approximates
+    // dependencies, which is safe) and clamps each host call to every active session's
+    // capability (which can only ever refuse more, also safe). A HostCall names no session,
+    // and a module could forge one if it did, so "every session in flight" is the only
+    // attribution that a module cannot widen.
+    static SESSIONS: RefCell<Vec<InFlight>> = const { RefCell::new(Vec::new()) };
     static NEXT_SINK_ID: Cell<u64> = const { Cell::new(0) };
 }
 
-fn install_sink() -> u64 {
+/// Register an invocation running under `capability`; its id is the handle `take_sink`
+/// releases it by.
+fn install_sink(capability: Capability) -> u64 {
     let id = NEXT_SINK_ID.with(|c| {
         let id = c.get();
         c.set(id.wrapping_add(1));
         id
     });
-    DEP_SINKS.with(|s| s.borrow_mut().push((id, RefCell::new(DepSink::default()))));
+    SESSIONS.with(|s| {
+        s.borrow_mut().push(InFlight {
+            id,
+            capability,
+            sink: RefCell::new(DepSink::default()),
+        })
+    });
     id
 }
 
 fn take_sink(id: u64) -> DepSink {
-    DEP_SINKS.with(|s| {
-        let mut sinks = s.borrow_mut();
-        match sinks.iter().position(|(sid, _)| *sid == id) {
-            Some(pos) => sinks.remove(pos).1.into_inner(),
+    SESSIONS.with(|s| {
+        let mut sessions = s.borrow_mut();
+        match sessions.iter().position(|session| session.id == id) {
+            Some(pos) => sessions.remove(pos).sink.into_inner(),
             None => DepSink::default(),
         }
+    })
+}
+
+/// The authority a host call carrying `carried` may run under: `carried` clamped to the
+/// capability of EVERY session in flight on this thread, so a module can only ever narrow
+/// what its session holds (the rule the native transports apply with one `clamp`). `None`
+/// when no session is in flight: there is then no authority to give the call at all.
+fn session_ceiling(carried: &Capability) -> Option<Capability> {
+    SESSIONS.with(|s| {
+        let sessions = s.borrow();
+        if sessions.is_empty() {
+            return None;
+        }
+        Some(sessions.iter().fold(carried.clone(), |held, session| {
+            session.capability.clamp(&held)
+        }))
     })
 }
 
@@ -1722,6 +1759,15 @@ fn take_sink(id: u64) -> DepSink {
 /// A failure is recorded too, by the rule core applies to a failed sub-request: a miss
 /// (`Unresolved` / `NotFound`) hangs the module's answer from the missing name, so a `Sink`
 /// that creates it cuts the answer; any other error makes the answer uncacheable.
+///
+/// **The capability `resolve` receives is never more than the session's.** A wasm module
+/// writes its own `HostCall` bytes, capability included, so what it carries is a claim: it is
+/// clamped to the capability the in-flight [`WasmModuleSpace`] invocation runs under (the
+/// rule the native transports apply), and a module can narrow its authority but never widen
+/// it. A `HostCall` names no session, so with several invocations in flight on this thread
+/// the call is clamped to every one of them; one that arrives with none in flight is refused
+/// as [`Error::Denied`] without calling `resolve`. So call this on the thread that drives the
+/// `WasmModuleSpace` (a browser host's only thread), which provenance already required.
 pub async fn serve_host_call<F, Fut>(reply: &[u8], resolve: F) -> Vec<u8>
 where
     F: FnOnce(Request, Capability) -> Fut,
@@ -1730,18 +1776,26 @@ where
     let answer = match decode::<ModuleReply>(reply) {
         Ok(ModuleReply::HostCall {
             request,
-            capability,
+            capability: carried,
         }) => {
+            let Some(capability) = session_ceiling(&carried) else {
+                return encode(&host_answer(Err(Error::Denied(format!(
+                    "serve_host_call: no module session is in flight on this thread, so a host \
+                     call for {} has no authority to run under",
+                    request.target.as_str()
+                )))))
+                .unwrap_or_default();
+            };
             let requested = request.target.clone();
             let result = resolve(request, capability).await;
             // A failure is provenance too, recorded as core records a failed sub-request:
             // without it, a module that swallows the error and answers cacheable is cached
             // with no edge on what was missing (ledger #530).
-            DEP_SINKS.with(|sinks| {
-                for (_, sink) in sinks.borrow().iter() {
+            SESSIONS.with(|sessions| {
+                for session in sessions.borrow().iter() {
                     match &result {
-                        Ok(representation) => sink.borrow_mut().record(representation),
-                        Err(error) => sink.borrow_mut().record_failure(&requested, error),
+                        Ok(representation) => session.sink.borrow_mut().record(representation),
+                        Err(error) => session.sink.borrow_mut().record_failure(&requested, error),
                     }
                 }
             });
@@ -1940,9 +1994,10 @@ impl Endpoint for WasmModuleEndpoint {
             request: inv.request.clone(),
             capability: inv.capability.clone(),
         })?;
-        // Install a sink so each `serve_host_call` records what it resolved; take it before
-        // `?` so it's cleaned up even on failure. Only the `u64` id crosses the await.
-        let sink_id = install_sink();
+        // Register the session so each `serve_host_call` records what it resolved into its
+        // sink and holds the module's host calls to this invocation's capability; take it
+        // before `?` so it's cleaned up even on failure. Only the `u64` id crosses the await.
+        let sink_id = install_sink(inv.capability.clone());
         let result = self.transport.invoke_session(invoke).await;
         let collected = take_sink(sink_id);
         let reply_bytes = result.map_err(Error::Endpoint)?;
@@ -3058,6 +3113,152 @@ mod tests {
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
         // The refs are permanently cacheable (no thread), so the folded result caches too.
         assert!(kernel.is_cached(&concat_request(), &Capability::root()));
+    }
+
+    // --- The out-of-band host call is held to its session (ledger #83) -----------------
+    //
+    // A wasm module is arbitrary code: it writes its own `HostCall` bytes, capability
+    // included. The native transports clamp what it carries to the session it was invoked
+    // under; the out-of-band path has to do the same, or a module invoked under a narrow
+    // session asks the host for anything by claiming root.
+
+    /// The host resource a forging module asks for: it answers with the capability it was
+    /// invoked under, so a test reads exactly the authority the host call ran with.
+    fn authority_echo() -> Arc<Kernel> {
+        Arc::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(
+                Exact::new("urn:test:authority"),
+                FnEndpoint::new("authority", |inv: &Invocation<'_>| {
+                    let held = match inv.capability.scopes() {
+                        None => "root".to_string(),
+                        Some(scopes) => scopes.iter().cloned().collect::<Vec<_>>().join(","),
+                    };
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        held.into_bytes(),
+                    ))
+                }),
+            )) as Arc<dyn Space>,
+            Arc::new(PlainRenderer),
+        ))
+    }
+
+    /// The host's answer to a forged host call claiming `claimed`, run through
+    /// `serve_host_call` exactly as a browser host's `hostCall` export runs it.
+    fn forged_host_call(host: &Arc<Kernel>, claimed: Capability) -> ModuleCall {
+        let forged = encode(&ModuleReply::HostCall {
+            request: Request::new(Verb::Source, Iri::parse("urn:test:authority").unwrap()),
+            capability: claimed,
+        })
+        .expect("encode the forged host call");
+        let host = Arc::clone(host);
+        let answer = block_on(serve_host_call(&forged, |request, capability| async move {
+            host.issue(request, &capability).await
+        }));
+        decode::<ModuleCall>(&answer).expect("a decodable answer")
+    }
+
+    /// A module session that ignores the capability it was invoked under and makes one
+    /// host call claiming `claimed`, answering with whatever the host gave it.
+    struct ForgingTransport {
+        host: Arc<Kernel>,
+        claimed: Capability,
+    }
+
+    #[async_trait]
+    impl ModuleSessionTransport for ForgingTransport {
+        async fn invoke_session(&self, _invoke: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
+            let forged = encode(&ModuleReply::HostCall {
+                request: Request::new(Verb::Source, Iri::parse("urn:test:authority").unwrap()),
+                capability: self.claimed.clone(),
+            })
+            .map_err(|e| e.to_string())?;
+            let host = Arc::clone(&self.host);
+            let answer = serve_host_call(&forged, |request, capability| async move {
+                host.issue(request, &capability).await
+            })
+            .await;
+            let reply = match answer_from(decode::<ModuleCall>(&answer).map_err(|e| e.to_string())?)
+            {
+                Ok(representation) => ModuleReply::Resolved(representation),
+                Err(error) => ModuleReply::ErrorTyped(ModuleError::from(&error)),
+            };
+            encode(&reply).map_err(|e| e.to_string())
+        }
+    }
+
+    /// What a forging module claiming `claimed` gets from the host when the module is
+    /// invoked under `session`.
+    fn forged_through_a_session(session: &Capability, claimed: Capability) -> Result<String> {
+        let kernel = Kernel::with_meta_renderer(
+            Arc::new(WasmModuleSpace::new(
+                ["urn:stub:"],
+                Arc::new(ForgingTransport {
+                    host: authority_echo(),
+                    claimed,
+                }),
+                Description::new("stub-forger"),
+                ModuleFloor::public(),
+            )) as Arc<dyn Space>,
+            Arc::new(PlainRenderer),
+        );
+        let request = Request::new(Verb::Source, Iri::parse("urn:stub:forger").unwrap());
+        block_on(kernel.issue(request, session))
+            .map(|rep| String::from_utf8(rep.bytes).expect("utf-8"))
+    }
+
+    #[test]
+    fn a_module_claiming_root_on_a_host_call_is_held_to_its_session() {
+        let session = Capability::scoped(["urn:cap:test:read"]);
+        let held = forged_through_a_session(&session, Capability::root()).expect("resolves");
+        assert_eq!(
+            held, "urn:cap:test:read",
+            "the host call must run under the session's authority, not the root it claimed"
+        );
+    }
+
+    #[test]
+    fn a_module_may_still_narrow_its_host_call() {
+        // Clamping keeps the module's own attenuation: under a root session, a host call
+        // carrying one scope runs with that one scope.
+        let held = forged_through_a_session(
+            &Capability::root(),
+            Capability::scoped(["urn:cap:test:read"]),
+        )
+        .expect("resolves");
+        assert_eq!(held, "urn:cap:test:read");
+    }
+
+    #[test]
+    fn a_host_call_with_no_session_in_flight_is_refused() {
+        // Nothing invoked a module on this thread, so there is no session to hold the call
+        // to — and no authority to give it.
+        match forged_host_call(&authority_echo(), Capability::root()) {
+            ModuleCall::HostError(ModuleError::Denied(_)) => {}
+            other => panic!("expected a typed Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_sessions_hold_a_host_call_to_every_one_of_them() {
+        // Two sessions in flight on one host thread, and a host call that names neither:
+        // it is held to what BOTH grant, so it can never borrow the wider session's
+        // authority. (The narrower session's own calls lose nothing; the wider one's may be
+        // over-refused while the two overlap, which is the safe direction.)
+        let wide = install_sink(Capability::scoped([
+            "urn:cap:test:read",
+            "urn:cap:test:write",
+        ]));
+        let narrow = install_sink(Capability::scoped(["urn:cap:test:read"]));
+        let answer = forged_host_call(&authority_echo(), Capability::root());
+        take_sink(narrow);
+        take_sink(wide);
+        match answer {
+            ModuleCall::HostResult(Ok(rep)) => {
+                assert_eq!(String::from_utf8(rep.bytes).unwrap(), "urn:cap:test:read")
+            }
+            other => panic!("expected the host call to resolve, got {other:?}"),
+        }
     }
 
     // --- A FAILED out-of-band host call is a dependency too (ledger #530) -------------
