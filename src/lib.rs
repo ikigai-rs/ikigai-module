@@ -4168,9 +4168,14 @@ mod tests {
         let rep = block_on(kernel.issue(join_request(), &Capability::root()))
             .expect("accepted, so it resolves");
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hello, module");
-        let warnings = warnings.lock().unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("cannot declare"), "{warnings:?}");
+        // Read the sink and RELEASE its lock before probing the cache: core 0.1.108's
+        // `is_cached` resolves through the mount, which calls the sink again, and holding
+        // the guard across it deadlocks this thread.
+        {
+            let warnings = warnings.lock().unwrap();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("cannot declare"), "{warnings:?}");
+        }
         // And the split it warned about is real: the answer is filed under the LOGICAL
         // name, because that is the only name the host ever knew.
         assert!(kernel.is_cached(&join_request(), &Capability::root()));
