@@ -97,6 +97,13 @@ libc = "0.2"
 # identical catalog and descriptions, cacheability by thread name, every error type
 # preserved in both directions.
 #
+# 0.10.0 = past 0.8: 0.9 adds core 0.1.105's contract-shape checks (`REQUIRED` probes input
+# groups, `OUTPUTS` honors `output_from`, `PIPELINE`'s named-only line, `VALIDATE` refuses a
+# default on a binding) and `RECOMPUTE`; 0.10 adds `FAILURES`, OFF unless a suite opts in
+# via `Suite::check_failures()` (this crate does not yet, so it reports `skipped: FAILURES`).
+# Read the caret as a RANGE: `"0.10.0"` is `<0.11.0`. Conformance's own floor is ikigai-core
+# 0.1.108, which the tests resolve; the `[dependencies]` pin stays put (library minimum).
+#
 # 0.8.0 = `REQUIRED` (ledger #329): each required by-value input the fixture declares
 # (`upper`'s `in`, `join`'s `a` and `b`, and, under `Suite::required_on_mutating`, `cell`'s
 # `content`) is dropped from the walked call and must be refused with a typed
@@ -118,4 +125,4 @@ libc = "0.2"
 # `ModuleSpace::new`, which never asks — so through the latter every statement about a module
 # endpoint named an id the walk could not reach, and the report printed them anyway. The fix
 # is one suite per manifold, not a version floor; the pin is what surfaced it.
-ikigai-conformance = "0.8.0"
+ikigai-conformance = "0.10.0"
