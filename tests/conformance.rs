@@ -557,9 +557,8 @@ fn catalog(kernel: &Kernel) -> Vec<SpaceEntry> {
         .collect()
 }
 
-/// Eight endpoints, nine actions, nothing skipped but `FAILURES` (off unless a suite opts in
-/// with `Suite::check_failures`, which is the next wave), nothing opted out, the declarations
-/// recorded.
+/// Eight endpoints, nine actions, nothing skipped (conformance 0.11 runs `FAILURES` and
+/// `DATATYPES` by default), nothing opted out, the declarations recorded.
 fn assert_shape(label: &str, report: &Report) {
     assert_eq!(
         report.endpoints,
@@ -569,8 +568,8 @@ fn assert_shape(label: &str, report: &Report) {
     assert_eq!(report.actions, 9, "{label}: {report}");
     assert_eq!(
         report.checks.skipped().count(),
-        1,
-        "{label}: only FAILURES skipped: {report}"
+        0,
+        "{label}: nothing skipped: {report}"
     );
     assert!(report.declared.opted_out.is_empty(), "{label}: {report}");
     assert_eq!(

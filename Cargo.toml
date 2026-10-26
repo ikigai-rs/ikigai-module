@@ -37,7 +37,13 @@ name = "ikigai-module"
 # signature change: `serve_host_call` clamps the capability a module's host call CARRIES to
 # the capability of the session that invoked it, and refuses a host call with no session in
 # flight (ledger #83: a wasm module could hand itself root). The module wire is unchanged.
-version = "0.4.0"
+#
+# 0.5.0: re-pinned to ikigai-core 0.2.0 (the streams release, ledger #2261). Core's types
+# (`Resolved`, `Error`, `Description`, `Space`, ...) are in this crate's public API, and the
+# 0.1 pin meant `<0.2.0` under 0.x rules, so a consumer on core 0.2 could not use 0.4.x
+# without linking two cores. Breaking for every consumer for that reason alone; no API
+# of this crate changed, and the module wire is unchanged.
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -72,7 +78,11 @@ keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 # `AliasTable::{parse, to_text}` (the declaration's text form on the wire), `AliasRule`'s
 # accessors (mount-time validation) and `Canonical` — plus, decisively, the kernel ADOPTING
 # a reported canonical, without which a declared rewrite would resolve and still split.
-ikigai-core = "0.1.73"
+#
+# 0.2.0 = the streams release (ledger #2261). The 0.1 pin above meant `<0.2.0` under 0.x
+# rules, so it could never admit 0.2; this is a new compatible range, not a floor raise
+# within the old one. Every 0.1 floor note above is history: 0.2.0 carries all of it.
+ikigai-core = "0.2.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 # A module's card crosses the wire as JSON text inside the postcard frame: core's
@@ -96,6 +106,12 @@ libc = "0.2"
 # module walked bare and through every mount, every report held to the bare one —
 # identical catalog and descriptions, cacheability by thread name, every error type
 # preserved in both directions.
+#
+# 0.11.0 = the core 0.2.0 sweep (ledger #2261): conformance 0.11 links ikigai-core 0.2, so
+# the test build links the same core as the library. It turns on two checks by default:
+# `DATATYPES` (a Turtle face's literal for an ik: property matches the property's
+# rdfs:range) and `FAILURES` (an action that states failure classes fails only with one of
+# them). Read the caret as a RANGE: `"0.11.0"` is `<0.12.0`.
 #
 # 0.10.0 = past 0.8: 0.9 adds core 0.1.105's contract-shape checks (`REQUIRED` probes input
 # groups, `OUTPUTS` honors `output_from`, `PIPELINE`'s named-only line, `VALIDATE` refuses a
@@ -125,4 +141,4 @@ libc = "0.2"
 # `ModuleSpace::new`, which never asks — so through the latter every statement about a module
 # endpoint named an id the walk could not reach, and the report printed them anyway. The fix
 # is one suite per manifold, not a version floor; the pin is what surfaced it.
-ikigai-conformance = "0.10.0"
+ikigai-conformance = "0.11.0"
