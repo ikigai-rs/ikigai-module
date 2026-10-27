@@ -1,3 +1,8 @@
+[workspace]
+# The root package plus the session's wire-only mirrors, which a wasm guest or another
+# language's peer takes without ikigai-core.
+members = [".", "crates/ikigai-module-abi"]
+
 [package]
 name = "ikigai-module"
 # 0.3.0: the module PROTOCOL grows, and `ModuleCall` / `ModuleReply` are public exhaustive
@@ -43,7 +48,14 @@ name = "ikigai-module"
 # 0.1 pin meant `<0.2.0` under 0.x rules, so a consumer on core 0.2 could not use 0.4.x
 # without linking two cores. Breaking for every consumer for that reason alone; no API
 # of this crate changed, and the module wire is unchanged.
-version = "0.5.0"
+#
+# 0.5.1: additive. The session's wire types without ikigai-core live in a second crate of this
+# workspace, `ikigai-module-abi` (crates/ikigai-module-abi), re-exported here as `abi`, with
+# `From`/`TryFrom` between this crate's session types and those mirrors and a new
+# `AbiConversionError`. No existing byte or public signature changed: `ModuleError` stays
+# here, because Rust's orphan rule would not let this crate keep its `From` conversions to and
+# from `ikigai_core::Error` on a type the abi crate owned. The abi crate mirrors it instead.
+version = "0.5.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -94,6 +106,10 @@ serde_json = "1"
 # postcard framing ikigai-wire uses; `alloc` keeps it wasm-clean).
 futures = "0.3"
 postcard = { version = "1", features = ["alloc"] }
+# The session's wire-only mirrors, re-exported as `ikigai_module::abi` and converted to and
+# from this crate's session types. A member of this workspace; the version is what a
+# published ikigai-module resolves, so the abi crate is published first.
+ikigai-module-abi = { version = "0.1.0", path = "crates/ikigai-module-abi" }
 
 # The UDS module server's peercred check (refuse connections from other users) needs the
 # kernel-verified peer UID — SO_PEERCRED / getpeereid — which is FFI. Unix only, so wasm
