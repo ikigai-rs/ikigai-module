@@ -96,11 +96,49 @@
 //! declared is said out loud rather than silently split: see [`ModuleRewrite::Undeclarable`]
 //! and [`OnUndeclarable`].
 //!
+//! ## The same session, without ikigai-core
+//!
+//! A wasm guest that speaks this session wants its bytes, not ikigai-core: [`abi`] (the
+//! `ikigai-module-abi` crate) mirrors [`ModuleCall`], [`ModuleReply`] and everything they carry
+//! as plain `no_std + alloc` data that encodes the same bytes, and this crate converts between
+//! the two shapes.
+//!
 //! See `ikigai-cli/docs/module-format-design.md`.
 
 // `deny`, not `forbid`, so the UDS server's peercred check (and only it) can opt into the
 // `libc` FFI it needs via a scoped `#[allow(unsafe_code)]`; everything else stays unsafe-free.
 #![deny(unsafe_code)]
+
+/// The session's wire types without ikigai-core: the [`ikigai_module_abi`] crate.
+///
+/// [`ModuleCall`] and [`ModuleReply`] carry ikigai-core's own types, which is right for a host
+/// and costly for a wasm guest. The abi crate mirrors them variant for variant and field for
+/// field, with plain strings where core has an [`Iri`] or a content id and the card's
+/// description as JSON text, so the two shapes encode the same bytes and either side may use
+/// either (`tests/abi_compat.rs`, `tests/vectors/module-abi.txt`). This crate converts between
+/// them: `From`/`TryFrom` on [`ModuleCall`], [`ModuleReply`] and the session's other own types,
+/// failing only where decoding the same bytes would ([`AbiConversionError`]).
+///
+/// ```
+/// use ikigai_core::{Capability, Iri, Request, Verb};
+/// use ikigai_module::abi::{AbiModuleCall, AbiVerb};
+/// use ikigai_module::ModuleCall;
+///
+/// let call = ModuleCall::Invoke {
+///     request: Request::new(Verb::Source, Iri::parse("urn:a").unwrap()),
+///     capability: Capability::root(),
+/// };
+/// let mirrored = AbiModuleCall::from(call.clone());
+/// let AbiModuleCall::Invoke { request, .. } = &mirrored else { unreachable!() };
+/// assert_eq!((request.verb, request.target.as_str()), (AbiVerb::Source, "urn:a"));
+///
+/// // The same bytes, whichever shape wrote them.
+/// assert_eq!(mirrored.encode().unwrap(), postcard::to_allocvec(&call).unwrap());
+/// ```
+pub use ikigai_module_abi as abi;
+
+mod convert;
+pub use convert::AbiConversionError;
 
 use async_trait::async_trait;
 use futures::channel::mpsc;
@@ -3328,15 +3366,31 @@ mod tests {
     struct ForgingTransport {
         host: Arc<Kernel>,
         claimed: Capability,
+        /// Write the forged host call with the abi crate's mirrors, as a guest that links no
+        /// ikigai-core would.
+        through_abi: bool,
     }
 
     #[async_trait]
     impl ModuleSessionTransport for ForgingTransport {
         async fn invoke_session(&self, _invoke: Vec<u8>) -> Result<Vec<u8>> {
-            let forged = encode(&ModuleReply::HostCall {
-                request: Request::new(Verb::Source, Iri::parse("urn:test:authority").unwrap()),
-                capability: self.claimed.clone(),
-            })?;
+            let forged = if self.through_abi {
+                let capability = match self.claimed.scopes() {
+                    None => abi::AbiCapability::root(),
+                    Some(scopes) => abi::AbiCapability::scoped(scopes.iter().cloned()),
+                };
+                abi::AbiModuleReply::HostCall {
+                    request: abi::AbiRequest::new(abi::AbiVerb::Source, "urn:test:authority"),
+                    capability,
+                }
+                .encode()
+                .expect("encode the forged host call")
+            } else {
+                encode(&ModuleReply::HostCall {
+                    request: Request::new(Verb::Source, Iri::parse("urn:test:authority").unwrap()),
+                    capability: self.claimed.clone(),
+                })?
+            };
             let host = Arc::clone(&self.host);
             let answer = serve_host_call(&forged, |request, capability| async move {
                 host.issue(request, &capability).await
@@ -3353,12 +3407,21 @@ mod tests {
     /// What a forging module claiming `claimed` gets from the host when the module is
     /// invoked under `session`.
     fn forged_through_a_session(session: &Capability, claimed: Capability) -> Result<String> {
+        forged_through_a_session_as(session, claimed, false)
+    }
+
+    fn forged_through_a_session_as(
+        session: &Capability,
+        claimed: Capability,
+        through_abi: bool,
+    ) -> Result<String> {
         let kernel = Kernel::with_meta_renderer(
             Arc::new(WasmModuleSpace::new(
                 ["urn:stub:"],
                 Arc::new(ForgingTransport {
                     host: authority_echo(),
                     claimed,
+                    through_abi,
                 }),
                 Description::new("stub-forger"),
                 ModuleFloor::public(),
@@ -3377,6 +3440,19 @@ mod tests {
         assert_eq!(
             held, "urn:cap:test:read",
             "the host call must run under the session's authority, not the root it claimed"
+        );
+    }
+
+    #[test]
+    fn a_guest_on_the_abi_mirrors_claiming_root_is_held_to_its_session() {
+        // The mirrors give a guest a capability it can write freely, which is no more than its
+        // raw bytes always could: the claim is clamped exactly as one written with core's types.
+        let session = Capability::scoped(["urn:cap:test:read"]);
+        let held =
+            forged_through_a_session_as(&session, Capability::root(), true).expect("resolves");
+        assert_eq!(
+            held, "urn:cap:test:read",
+            "a host call written with the mirrors must run under the session, not its claim"
         );
     }
 

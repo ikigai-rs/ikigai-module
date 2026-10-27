@@ -31,6 +31,7 @@ module's result is cached and invalidated exactly as a statically-linked space w
 | `ModuleFloor` | host | What the mount **may do** — the capability floor every non-`Meta` verb under it requires. The host's word, not the module's (see below). |
 | `ModuleError` | wire | The error taxonomy on the module wire — a mirror of `ikigai_core::Error`, so a failure keeps its **type** across the boundary in both directions (see below). |
 | `ModuleCard` | wire | One binding and the card its endpoint answers `Meta` with — what `ModuleSpace::connect` asks for, so the module's endpoints describe themselves through the mount. |
+| `abi` (`ikigai-module-abi`) | wire | The same session as plain data without ikigai-core: mirrors of `ModuleCall` / `ModuleReply` and everything they carry, byte-compatible, for wasm guests and other-language peers (see below). |
 
 ## Why a session, not a round-trip
 
@@ -244,6 +245,37 @@ can describe itself. Three things keep the residual visible instead of silent:
 A declared table is also validated at mount time: it must parse, and every rule must stay
 inside the prefixes the host routed to the module. A module may only canonicalize names it
 was given.
+
+## The session without ikigai-core: `ikigai-module-abi`
+
+`ModuleCall` and `ModuleReply` carry ikigai-core's own types, which is right for a host and
+costly for a guest: deserializing an `Iri` runs the full RFC 3987 parser and a card's
+description goes through `serde_json`, so a minimal wasm guest built on them is about three
+times the size of one that only speaks the bytes. The second crate in this workspace,
+[`ikigai-module-abi`](crates/ikigai-module-abi), is the same session as plain `no_std + alloc`
+data: `AbiModuleCall`, `AbiModuleReply`, `AbiRequest`, `AbiCapability`, `AbiRepresentation`
+and the rest, variant for variant and field for field, with `String` where core has an `Iri`
+or a content id and the card's description as the JSON text it already is on the wire. Its
+dependencies are `serde` (derive, `alloc`) and `postcard` (`alloc`), and no ikigai crate.
+
+Who it is for:
+
+- **wasm guests**, which want the session and nothing else;
+- **peers in other languages** (the Python, Deno and .NET faces), for whom its definitions
+  are the readable statement of the wire and
+  [`tests/vectors/module-abi.txt`](tests/vectors/module-abi.txt) the test of it: one
+  postcard encoding per message variant, in hex.
+
+A Rust host keeps using this crate, which re-exports the mirrors as `ikigai_module::abi` and
+converts between the shapes (`From`/`TryFrom` on `ModuleCall`, `ModuleReply`, `ModuleError`,
+`ModuleRewrite`, `ModuleManifest` and `ModuleCard`). `tests/abi_compat.rs` proves the two
+shapes are one wire: every variant of both enums, built with each, encodes the same bytes,
+and each side's bytes decode as the other's and re-encode unchanged.
+
+A mirror checks nothing a string can hold (a target is not parsed as an IRI until something
+turns it into one), and an `AbiCapability` is a guest's **claim**: a host holds every host
+call to the capability of the session it belongs to (`serve_host_call` clamps it), never to
+the one the guest wrote.
 
 ## Transports: one exists, one is designed for
 

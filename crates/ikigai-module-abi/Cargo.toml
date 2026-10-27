@@ -1,0 +1,24 @@
+[package]
+name = "ikigai-module-abi"
+# 0.1.0: the module session's wire types, without ikigai-core. Every type here mirrors the one
+# ikigai-module 0.5 puts on the postcard wire, variant for variant and field for field, so the
+# two encode the same bytes (ikigai-module's `tests/abi_compat.rs` and `tests/vectors/` pin it).
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+description = "The ikigai module session's wire types (ModuleCall/ModuleReply and everything they carry) as plain no_std + alloc data, byte-compatible with ikigai-module and free of ikigai-core: for wasm guests and for peers written in other languages."
+repository = "https://github.com/ikigai-rs/ikigai-module"
+homepage = "https://github.com/ikigai-rs/ikigai-module"
+keywords = ["ikigai", "roc", "module", "wasm", "abi"]
+categories = ["encoding", "no-std", "wasm"]
+
+[dependencies]
+# `alloc` only: a guest wants `no_std + alloc` to be possible, so nothing here asks for `std`.
+# The derive is the whole point (the mirrors ARE their serde shape); `alloc` gives String,
+# Vec and the B-tree collections their impls.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# The codec the session already uses (ikigai-module and ikigai-wire frame with postcard 1).
+# Carried here so a guest and a host cannot disagree about it; `alloc` for `to_allocvec`, and
+# no default features, which would pull `heapless` in for a guest that never uses it.
+postcard = { version = "1", default-features = false, features = ["alloc"] }

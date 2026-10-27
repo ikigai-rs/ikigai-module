@@ -1,0 +1,4 @@
+# The module session's checked-in vectors are compared byte for byte by other-language faces
+# (devtools `vector-drift`), so a CRLF checkout of one is drift. `eol=lf` on a path overrides
+# core.autocrlf (Git for Windows installs with it on). Ledger #1205.
+tests/vectors/* text eol=lf
