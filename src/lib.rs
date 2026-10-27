@@ -3828,8 +3828,10 @@ mod tests {
         // real socket as a framed `Manifest`, the host installs it, and the same one-identity
         // property holds. Each `invoke` opens its own connection, so the server runs its
         // normal accept loop rather than the single-connection harness below.
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixStream;
         use std::thread;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let path = std::env::temp_dir().join(format!(
             "ikigai-module-uds-alias-{}.sock",
@@ -3844,13 +3846,22 @@ mod tests {
         thread::spawn(move || {
             let _ = crate::uds::serve_declaring(space, rewrite, &served);
         });
-        // The listener is bound on another thread; wait for the socket to appear rather
-        // than racing it.
-        for _ in 0..400 {
-            if path.exists() {
-                break;
+        // bind() creates the socket path before listen() makes it ready. Probe the
+        // connection instead; the server safely drops this empty session at EOF.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match UnixStream::connect(&path) {
+                Ok(_) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                    ) && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("module socket did not become ready: {error}"),
             }
-            thread::sleep(Duration::from_millis(5));
         }
 
         let transport = Arc::new(crate::uds::UdsTransport::connect(&path));
