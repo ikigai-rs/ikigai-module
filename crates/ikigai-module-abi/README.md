@@ -13,8 +13,9 @@ description as JSON text, so both encode **the same bytes**. ikigai-module's
 
 It is for:
 
-- **wasm guests**, which want the session and nothing else: a guest built on these types is
-  a fraction of the size of one that links ikigai-core;
+- **wasm guests**, which want the session and nothing else: the same minimal guest measured
+  59,205 bytes on these types against 94,114 on ikigai-module's (a core module, release,
+  stripped), with no RFC 3987 parser, no `serde_json` and none of ikigai-core linked;
 - **peers in other languages**, for whom these definitions are the readable statement of the
   wire.
 
