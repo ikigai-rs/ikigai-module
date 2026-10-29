@@ -123,6 +123,11 @@ libc = "0.2"
 # identical catalog and descriptions, cacheability by thread name, every error type
 # preserved in both directions.
 #
+# 0.12.0 = BODIES and BODY-INPUTS are selected by default. The suite supplies the
+# kernel's shared root for direct invoke/invoke_body agreement and bounded collection.
+# The fixture declares no reads_body inputs. The library core floor stays at 0.2.0;
+# conformance supplies its own newer core floor for tests. This caret means <0.13.0.
+#
 # 0.11.0 = the core 0.2.0 sweep (ledger #2261): conformance 0.11 links ikigai-core 0.2, so
 # the test build links the same core as the library. It turns on two checks by default:
 # `DATATYPES` (a Turtle face's literal for an ik: property matches the property's
@@ -157,4 +162,4 @@ libc = "0.2"
 # `ModuleSpace::new`, which never asks — so through the latter every statement about a module
 # endpoint named an id the walk could not reach, and the report printed them anyway. The fix
 # is one suite per manifold, not a version floor; the pin is what surfaced it.
-ikigai-conformance = "0.11.0"
+ikigai-conformance = "0.12.0"

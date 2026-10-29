@@ -557,8 +557,8 @@ fn catalog(kernel: &Kernel) -> Vec<SpaceEntry> {
         .collect()
 }
 
-/// Eight endpoints, nine actions, nothing skipped (conformance 0.11 runs `FAILURES` and
-/// `DATATYPES` by default), nothing opted out, the declarations recorded.
+/// Eight endpoints, nine actions, all checks selected, nothing opted out.
+/// Only the two uncacheable Sources may remain unprobed by BODIES.
 fn assert_shape(label: &str, report: &Report) {
     assert_eq!(
         report.endpoints,
@@ -571,6 +571,18 @@ fn assert_shape(label: &str, report: &Report) {
         0,
         "{label}: nothing skipped: {report}"
     );
+    assert_eq!(report.unprobed.len(), 2, "{label}: {report}");
+    for unprobed in report.unprobed.iter() {
+        assert!(
+            matches!(unprobed.endpoint.as_str(), "live" | "gated")
+                && unprobed.verb == Verb::Source
+                && unprobed.check == Check::Bodies
+                && unprobed
+                    .reason
+                    .starts_with("uncacheable, time-varying, or volatile answer:"),
+            "{label}: unexpected coverage gap: {unprobed:?}"
+        );
+    }
     assert!(report.declared.opted_out.is_empty(), "{label}: {report}");
     assert_eq!(
         report.declared.cacheable,
@@ -602,8 +614,9 @@ fn assert_host_named(label: &str, report: &Report) {
 /// verbatim, which the suite's static checks passing would not by themselves prove.
 #[test]
 fn conforms() {
-    let bare = Kernel::new(root(host_space(), Leaf::new().space()));
-    let report = suite().run_blocking(&bare);
+    let bare_space = root(host_space(), Leaf::new().space());
+    let bare = Kernel::new(Arc::clone(&bare_space));
+    let report = suite().body_space(bare_space).run_blocking(&bare);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("bare: {report}");
     assert!(report.is_clean(), "bare: {report}");
@@ -623,11 +636,13 @@ fn conforms() {
             ModuleRewrite::None,
             ModuleFloor::public(),
         );
-        let kernel = Kernel::new(root(host, Arc::clone(&space)));
+        let body_space = root(host, Arc::clone(&space));
+        let kernel = Kernel::new(Arc::clone(&body_space));
         // SPACE-NAME: every mount is instance-built (prefixes, a transport, a floor), so the
         // HOST names it and the mount claims nothing — two mounts of two different modules
         // must never share a cache partition by a name the module chose.
         let report = suite()
+            .body_space(body_space)
             .host_named_space(format!("ikigai_module::{label}"), space)
             .run_blocking(&kernel);
         eprintln!("{label}: {report}");
@@ -668,12 +683,15 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
         ModuleFloor::public(),
     );
     let unasked: Arc<dyn Space> = Arc::new(unasked);
-    let kernel = Kernel::new(root(host_space(), Arc::clone(&unasked)));
+    let body_space = root(host_space(), Arc::clone(&unasked));
+    let kernel = Kernel::new(Arc::clone(&body_space));
     let report = host_suite()
+        .body_space(Arc::clone(&body_space))
         .host_named_space("ikigai_module::ModuleSpace::new", Arc::clone(&unasked))
         .run_blocking(&kernel);
     eprintln!("unasked: {report}");
     assert_host_named("ModuleSpace::new", &report);
+    assert!(report.unprobed.is_empty(), "{report}");
     // The module's rows are still listed (the transport enumerates)…
     assert_eq!(
         catalog(&kernel).len(),
@@ -703,7 +721,7 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
     // a mount cannot reach them. DECLARATIONS is what says so; through conformance 0.1 all
     // seven per-id ones were printed under `declared cacheable:` as though a check had
     // consulted them.
-    let report = suite().run_blocking(&kernel);
+    let report = suite().body_space(body_space).run_blocking(&kernel);
     eprintln!("unasked, under the module's own suite: {report}");
     let (suite_wide, inert): (Vec<&Finding>, Vec<&Finding>) = report
         .findings
@@ -756,14 +774,15 @@ fn a_mount_that_never_asked_describes_one_endpoint_named_module() {
 #[test]
 fn the_floor_is_visible_and_enforced() {
     for (label, mount) in mounted() {
-        let kernel = Kernel::new(host_root(
+        let body_space = host_root(
             mount,
             host_space(),
             Leaf::new().space(),
             ModuleRewrite::None,
             ModuleFloor::requiring(MOUNT_CAP),
-        ));
-        let report = suite().run_blocking(&kernel);
+        );
+        let kernel = Kernel::new(Arc::clone(&body_space));
+        let report = suite().body_space(body_space).run_blocking(&kernel);
         eprintln!("{label} under a floor: {report}");
         assert!(report.is_clean(), "{label}: {report}");
         assert_shape(label, &report);
