@@ -295,6 +295,11 @@ The full design is
 [`docs/module-format-design.md`](https://github.com/ikigai-rs/ikigai-cli/blob/main/docs/module-format-design.md)
 in `ikigai-cli`.
 
+## Accessibility
+
+What this crate emits that people read (its refusals, protocol errors and one warning), the rules
+that text follows and how to report a barrier are in [ACCESSIBILITY.md](ACCESSIBILITY.md).
+
 ## License
 
 Licensed under either of MIT or Apache-2.0 at your option (`MIT OR Apache-2.0`).
