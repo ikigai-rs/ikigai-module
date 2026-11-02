@@ -2322,6 +2322,25 @@ mod uds {
         Error::Endpoint(format!("module socket transport: {e}"))
     }
 
+    /// Open one connection to the module server on `path`: the client half of the
+    /// out-of-process transport, and the only place this crate dials a socket.
+    // ambient: net: the out-of-process module transport is this connector's job; it dials only the socket path the host handed `UdsTransport::connect`, never a name from a request
+    #[allow(clippy::disallowed_methods)]
+    fn dial(path: &Path) -> io::Result<UnixStream> {
+        UnixStream::connect(path)
+    }
+
+    /// Bind the module server's socket on `path`, replacing a stale one, and restrict it
+    /// to `0600`: the server half of the transport, and the only place this crate binds.
+    // ambient: fs, net: the module server's own listening socket at the path its host passed to `serve` (never a request name): remove a leftover socket, bind, then chmod it owner-only
+    #[allow(clippy::disallowed_methods)]
+    fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
+        let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
+        let listener = UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
+    }
+
     /// A [`ModuleTransport`] that reaches a module served on a Unix socket. Each `invoke`
     /// opens a connection, runs one session, and closes it (so concurrent invocations
     /// never share a stream). The host-side loop is the loopback's, over framed socket I/O.
@@ -2344,7 +2363,7 @@ mod uds {
             capability: &Capability,
             host: &dyn Issuer,
         ) -> Result<Representation> {
-            let mut stream = UnixStream::connect(&self.path).map_err(io_err)?;
+            let mut stream = dial(&self.path).map_err(io_err)?;
             let invoke = ModuleCall::Invoke {
                 request,
                 capability: capability.clone(),
@@ -2368,7 +2387,7 @@ mod uds {
         fn entries(&self) -> Option<Vec<SpaceEntry>> {
             // Ask the server over the wire (`Describe`); best-effort, so introspection of
             // an unreachable module degrades to "no entries" rather than erroring.
-            let mut stream = UnixStream::connect(&self.path).ok()?;
+            let mut stream = dial(&self.path).ok()?;
             write_frame(&mut stream, &ModuleCall::Describe).ok()?;
             match read_frame::<_, ModuleReply>(&mut stream).ok()? {
                 ModuleReply::Bindings(entries) => entries,
@@ -2377,7 +2396,7 @@ mod uds {
         }
 
         async fn manifest(&self) -> Result<ModuleManifest> {
-            let mut stream = UnixStream::connect(&self.path).map_err(io_err)?;
+            let mut stream = dial(&self.path).map_err(io_err)?;
             write_frame(&mut stream, &ModuleCall::Manifest).map_err(io_err)?;
             // Connect/write failures are real errors (the module is unreachable); anything
             // that comes back other than a `Manifest` is not. A server older than
@@ -2391,7 +2410,7 @@ mod uds {
         }
 
         async fn cards(&self) -> Result<Vec<ModuleCard>> {
-            let mut stream = UnixStream::connect(&self.path).map_err(io_err)?;
+            let mut stream = dial(&self.path).map_err(io_err)?;
             write_frame(&mut stream, &ModuleCall::Cards).map_err(io_err)?;
             // A server older than `ModuleCall::Cards` cannot decode the frame and drops the
             // connection: no cards, which is exactly what such a server can say.
@@ -2424,9 +2443,7 @@ mod uds {
         rewrite: ModuleRewrite,
         path: &Path,
     ) -> io::Result<()> {
-        let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
-        let listener = UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = bind_owner_only(path)?;
         let me = own_uid();
         for stream in listener.incoming() {
             let stream = stream?;
