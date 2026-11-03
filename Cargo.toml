@@ -55,7 +55,12 @@ name = "ikigai-module"
 # `AbiConversionError`. No existing byte or public signature changed: `ModuleError` stays
 # here, because Rust's orphan rule would not let this crate keep its `From` conversions to and
 # from `ikigai_core::Error` on a type the abi crate owned. The abi crate mirrors it instead.
-version = "0.5.1"
+#
+# 0.6.0: re-pinned to ikigai-core 0.3.0 (the scoped content store, ledger #2965). Core's types
+# are in this crate's public API, and the 0.2 pin meant `<0.3.0` under 0.x rules, so a consumer
+# on core 0.3 could not use 0.5.x without linking two cores. Breaking for every consumer for
+# that reason alone; no API of this crate changed, and the module wire is unchanged.
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -94,7 +99,11 @@ keywords = ["ikigai", "roc", "module", "wasm", "plugin"]
 # 0.2.0 = the streams release (ledger #2261). The 0.1 pin above meant `<0.2.0` under 0.x
 # rules, so it could never admit 0.2; this is a new compatible range, not a floor raise
 # within the old one. Every 0.1 floor note above is history: 0.2.0 carries all of it.
-ikigai-core = "0.2.0"
+#
+# 0.3.0 = the scoped content store (ledger #2965): held content is scoped to whoever delivered
+# it, a principal-less hold is root's, and `ContentStore::put`/`put_replay` are root-only. This
+# crate calls neither. A new compatible range again: `"0.2.0"` meant `<0.3.0`.
+ikigai-core = "0.3.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 # A module's card crosses the wire as JSON text inside the postcard frame: core's
@@ -122,6 +131,9 @@ libc = "0.2"
 # module walked bare and through every mount, every report held to the bare one —
 # identical catalog and descriptions, cacheability by thread name, every error type
 # preserved in both directions.
+#
+# 0.14.0 = the core 0.3.0 sweep (ledger #2965): conformance 0.14 links ikigai-core 0.3, so the
+# test build links the same core as the library. This caret means <0.15.0.
 #
 # 0.12.0 = BODIES and BODY-INPUTS are selected by default. The suite supplies the
 # kernel's shared root for direct invoke/invoke_body agreement and bounded collection.
@@ -162,4 +174,4 @@ libc = "0.2"
 # `ModuleSpace::new`, which never asks — so through the latter every statement about a module
 # endpoint named an id the walk could not reach, and the report printed them anyway. The fix
 # is one suite per manifold, not a version floor; the pin is what surfaced it.
-ikigai-conformance = "0.12.0"
+ikigai-conformance = "0.14.0"
