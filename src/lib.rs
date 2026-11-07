@@ -909,40 +909,6 @@ fn refuse_unsatisfied_declaration(
     ))
 }
 
-/// The value a template variable is probed with to reach the endpoint behind a template
-/// binding for its card — what core's (private) `describe_entry` does.
-const PROBE: &str = "probe";
-
-/// The card of one bound entry, as the module's own space answers it: a `Meta` resolution
-/// of the pattern (an exact IRI), or of the template expanded with a probe value — guarded,
-/// as core guards it, against a shorter sibling swallowing the probe.
-fn describe_entry(space: &dyn Space, entry: &SpaceEntry) -> Option<Description> {
-    let (target, templated) = match Iri::parse(&entry.pattern) {
-        Ok(iri) => (iri, false),
-        Err(_) => {
-            let template = UriTemplate::parse(&entry.pattern).ok()?;
-            let mut bindings = Bindings::new();
-            for var in template.variables() {
-                bindings.insert(var, PROBE);
-            }
-            if bindings.is_empty() {
-                return None; // no variables ⇒ a malformed IRI, not a template
-            }
-            (Iri::parse(template.expand(&bindings)?).ok()?, true)
-        }
-    };
-    let Resolution::Hit(resolved) =
-        space.resolve(&Request::new(Verb::Meta, target), &Scope::empty())
-    else {
-        return None;
-    };
-    let description = resolved.endpoint.describe();
-    if templated && resolved.endpoint.name() != entry.endpoint && description.id != entry.endpoint {
-        return None;
-    }
-    Some(description)
-}
-
 /// Every bound entry's card — the module side of [`ModuleCall::Cards`].
 fn cards_of(space: &dyn Space) -> Vec<ModuleCard> {
     space
@@ -950,7 +916,10 @@ fn cards_of(space: &dyn Space) -> Vec<ModuleCard> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|entry| {
-            describe_entry(space, &entry).map(|description| ModuleCard { entry, description })
+            ikigai_core::describe_entry(space, &entry).map(|described| ModuleCard {
+                entry,
+                description: described.description,
+            })
         })
         .collect()
 }
@@ -4415,6 +4384,55 @@ mod tests {
         match decode::<ModuleReply>(&bytes).unwrap() {
             ModuleReply::Cards(cards) => assert_eq!(cards, [card]),
             other => panic!("expected Cards, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_cards_omit_a_family_carved_out_by_a_limit() {
+        let module: Arc<dyn Space> = Arc::new(Fallback::new(vec![
+            Arc::new(ikigai_core::Limit::new("urn:stub:private:")),
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(
+                        Exact::new("urn:stub:private:exact"),
+                        fixed("private-exact", "text/plain", "private"),
+                    )
+                    .bind(
+                        UriTemplate::parse("urn:stub:private:{word}").unwrap(),
+                        fixed("private-template", "text/plain", "private"),
+                    )
+                    .bind(
+                        Exact::new("urn:stub:public"),
+                        fixed("public", "text/plain", "public"),
+                    ),
+            ),
+        ]));
+        // Enumeration still includes the bindings behind the limiter. A Meta hit on
+        // its distinguished endpoint must not turn into a card for a hidden binding.
+        assert_eq!(module.entries().unwrap().len(), 3);
+        let Resolution::Hit(resolved) = module.resolve(
+            &Request::new(Verb::Meta, Iri::parse("urn:stub:private:exact").unwrap()),
+            &Scope::empty(),
+        ) else {
+            panic!("a limiter resolves to its distinguished endpoint");
+        };
+        assert!(resolved.endpoint.is_limiter());
+
+        let transports: Vec<Arc<dyn ModuleTransport>> = vec![
+            Arc::new(InProcessTransport::from_arc(Arc::clone(&module))),
+            Arc::new(LoopbackTransport::from_arc(module)),
+        ];
+        for transport in transports {
+            let cards = block_on(transport.cards()).unwrap();
+            assert_eq!(
+                cards
+                    .iter()
+                    .map(|card| card.entry.pattern.as_str())
+                    .collect::<Vec<_>>(),
+                ["urn:stub:public"],
+                "only the reachable sibling has a module card",
+            );
+            assert_eq!(cards[0].description.id, "public");
         }
     }
 
