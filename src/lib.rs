@@ -4419,6 +4419,55 @@ mod tests {
     }
 
     #[test]
+    fn module_cards_omit_a_family_carved_out_by_a_limit() {
+        let module: Arc<dyn Space> = Arc::new(Fallback::new(vec![
+            Arc::new(ikigai_core::Limit::new("urn:stub:private:")),
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(
+                        Exact::new("urn:stub:private:exact"),
+                        fixed("private-exact", "text/plain", "private"),
+                    )
+                    .bind(
+                        UriTemplate::parse("urn:stub:private:{word}").unwrap(),
+                        fixed("private-template", "text/plain", "private"),
+                    )
+                    .bind(
+                        Exact::new("urn:stub:public"),
+                        fixed("public", "text/plain", "public"),
+                    ),
+            ),
+        ]));
+        // Enumeration still includes the bindings behind the limiter. A Meta hit on
+        // its distinguished endpoint must not turn into a card for a hidden binding.
+        assert_eq!(module.entries().unwrap().len(), 3);
+        let Resolution::Hit(resolved) = module.resolve(
+            &Request::new(Verb::Meta, Iri::parse("urn:stub:private:exact").unwrap()),
+            &Scope::empty(),
+        ) else {
+            panic!("a limiter resolves to its distinguished endpoint");
+        };
+        assert!(resolved.endpoint.is_limiter());
+
+        let transports: Vec<Arc<dyn ModuleTransport>> = vec![
+            Arc::new(InProcessTransport::from_arc(Arc::clone(&module))),
+            Arc::new(LoopbackTransport::from_arc(module)),
+        ];
+        for transport in transports {
+            let cards = block_on(transport.cards()).unwrap();
+            assert_eq!(
+                cards
+                    .iter()
+                    .map(|card| card.entry.pattern.as_str())
+                    .collect::<Vec<_>>(),
+                ["urn:stub:public"],
+                "only the reachable sibling has a module card",
+            );
+            assert_eq!(cards[0].description.id, "public");
+        }
+    }
+
+    #[test]
     fn connect_installs_the_modules_cards_through_the_codec() {
         // The module's own `describe()` reaches the kernel through a `connect`ed mount —
         // over the loopback, so the cards crossed as bytes — for an exact and for a template
