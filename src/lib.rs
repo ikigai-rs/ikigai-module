@@ -909,40 +909,6 @@ fn refuse_unsatisfied_declaration(
     ))
 }
 
-/// The value a template variable is probed with to reach the endpoint behind a template
-/// binding for its card — what core's (private) `describe_entry` does.
-const PROBE: &str = "probe";
-
-/// The card of one bound entry, as the module's own space answers it: a `Meta` resolution
-/// of the pattern (an exact IRI), or of the template expanded with a probe value — guarded,
-/// as core guards it, against a shorter sibling swallowing the probe.
-fn describe_entry(space: &dyn Space, entry: &SpaceEntry) -> Option<Description> {
-    let (target, templated) = match Iri::parse(&entry.pattern) {
-        Ok(iri) => (iri, false),
-        Err(_) => {
-            let template = UriTemplate::parse(&entry.pattern).ok()?;
-            let mut bindings = Bindings::new();
-            for var in template.variables() {
-                bindings.insert(var, PROBE);
-            }
-            if bindings.is_empty() {
-                return None; // no variables ⇒ a malformed IRI, not a template
-            }
-            (Iri::parse(template.expand(&bindings)?).ok()?, true)
-        }
-    };
-    let Resolution::Hit(resolved) =
-        space.resolve(&Request::new(Verb::Meta, target), &Scope::empty())
-    else {
-        return None;
-    };
-    let description = resolved.endpoint.describe();
-    if templated && resolved.endpoint.name() != entry.endpoint && description.id != entry.endpoint {
-        return None;
-    }
-    Some(description)
-}
-
 /// Every bound entry's card — the module side of [`ModuleCall::Cards`].
 fn cards_of(space: &dyn Space) -> Vec<ModuleCard> {
     space
@@ -950,7 +916,10 @@ fn cards_of(space: &dyn Space) -> Vec<ModuleCard> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|entry| {
-            describe_entry(space, &entry).map(|description| ModuleCard { entry, description })
+            ikigai_core::describe_entry(space, &entry).map(|described| ModuleCard {
+                entry,
+                description: described.description,
+            })
         })
         .collect()
 }
