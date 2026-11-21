@@ -288,7 +288,7 @@ pub enum ModuleReply {
 /// use ikigai_core::Error;
 /// use ikigai_module::ModuleError;
 ///
-/// let denied = Error::Denied("not yours".to_string());
+/// let denied = Error::Denied("not yours".into());
 /// let back: Error = ModuleError::from(&denied).into();
 /// assert_eq!(back, denied);
 /// assert!(!back.is_transient(), "a denial stays permanent across the boundary");
@@ -333,7 +333,7 @@ impl From<&Error> for ModuleError {
                 detail: detail.clone(),
             },
             Error::Endpoint(message) => ModuleError::Endpoint(message.clone()),
-            Error::Denied(message) => ModuleError::Denied(message.clone()),
+            Error::Denied(denial) => ModuleError::Denied(denial.message().to_string()),
             Error::NotFound(message) => ModuleError::NotFound(message.clone()),
             Error::Timeout(message) => ModuleError::Timeout(message.clone()),
             Error::Unavailable(message) => ModuleError::Unavailable(message.clone()),
@@ -360,7 +360,7 @@ impl From<ModuleError> for Error {
                 Error::InvalidArgument { name, detail }
             }
             ModuleError::Endpoint(message) => Error::Endpoint(message),
-            ModuleError::Denied(message) => Error::Denied(message),
+            ModuleError::Denied(message) => Error::Denied(message.into()),
             ModuleError::NotFound(message) => Error::NotFound(message),
             ModuleError::Timeout(message) => Error::Timeout(message),
             ModuleError::Unavailable(message) => Error::Unavailable(message),
@@ -841,12 +841,13 @@ impl ModuleFloor {
     /// The denial for an invocation that does not clear this floor. Says what to add,
     /// because a denial alone does not tell an operator where the requirement lives.
     fn denial(&self, scope: &str, target: &str) -> Error {
-        Error::Denied(format!(
+        let message = format!(
             "capability does not grant `{scope}` (the capability floor of the module mount \
              serving `{target}`). Grant the scope, or mount the module with a floor the \
              caller clears — `ModuleFloor::requiring(..)` at the mount, refined per endpoint \
              with `with_endpoint(iri, Description::new(..).verb(..).requires(..))`."
-        ))
+        );
+        Error::Denied(message.into())
     }
 }
 
@@ -1793,12 +1794,13 @@ where
             capability: carried,
         }) => {
             let Some(capability) = session_ceiling(&carried) else {
-                return encode(&host_answer(Err(Error::Denied(format!(
+                let message = format!(
                     "serve_host_call: no module session is in flight on this thread, so a host \
                      call for {} has no authority to run under",
                     request.target.as_str()
-                )))))
-                .unwrap_or_default();
+                );
+                return encode(&host_answer(Err(Error::Denied(message.into()))))
+                    .unwrap_or_default();
             };
             let requested = request.target.clone();
             let result = resolve(request, capability).await;
