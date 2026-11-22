@@ -41,7 +41,7 @@ fn generated_requests_and_representations_round_trip() {
                     "reference",
                     ArgRef::Reference(Iri::parse("urn:test:ref").unwrap()),
                 )
-                .with_arg("stored", ArgRef::Content(id.clone()));
+                .with_arg("stored", ArgRef::Content(id));
             let original = ModuleCall::Invoke {
                 request,
                 capability: Capability::scoped(["urn:cap:read"]),
